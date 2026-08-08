@@ -149,6 +149,17 @@ fn execute_command(
             terminal,
         )?,
         AppCommand::RefreshHome => refresh_home(command, app, provider, history, terminal)?,
+        AppCommand::DeleteHistory(id) => {
+            if history.remove_repository(&id)? {
+                app.update_history(history.entries().to_vec());
+                app.set_status(format!("Removed {} from History", id.full_name()));
+            }
+        }
+        AppCommand::ClearHistory => {
+            history.clear()?;
+            app.update_history(Vec::new());
+            app.set_status("Browsing history cleared");
+        }
         AppCommand::SearchRepositories(query) => {
             let results = request(
                 app,

@@ -259,7 +259,12 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
 
 fn draw_history_list(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
     let focused = app.home.focus == HomeFocus::History;
-    let title = app.icons.label(app.icons.history, "History");
+    let title = if focused {
+        app.icons
+            .label(app.icons.history, "History · d delete · Ctrl+D clear")
+    } else {
+        app.icons.label(app.icons.history, "History")
+    };
     let items = app
         .home
         .history
@@ -1418,6 +1423,22 @@ fn split_numbered_diff(line: &str) -> Option<(&str, char, &str)> {
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal, theme: Theme) {
     match modal {
         Modal::Help => draw_text_modal(frame, "Help", help_lines(app, theme), 88, 32, theme),
+        Modal::ConfirmClearHistory => draw_text_modal(
+            frame,
+            "Clear browsing history?",
+            vec![
+                Line::raw("Delete all repository browsing history from this device?"),
+                Line::raw(""),
+                Line::styled(
+                    "Enter / y  Clear all history",
+                    Style::new().fg(theme.danger),
+                ),
+                Line::styled("Esc / n    Cancel", Style::new().fg(theme.muted)),
+            ],
+            62,
+            9,
+            theme,
+        ),
         Modal::Settings { index } => {
             let options = [
                 format!("Theme               {}", app.settings.theme.label()),
@@ -1767,6 +1788,8 @@ fn help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
         Line::raw("  owner/repo        Directly open exactly one repository"),
         Line::raw("  other text        GitHub best-match repository search"),
         Line::raw("  ↑↓ / Tab          Move consistently between sections and rows"),
+        Line::raw("  d                 Delete selected History entry"),
+        Line::raw("  Ctrl+D            Clear all History (confirmation required)"),
         Line::raw("  F5 / Ctrl+R       Refresh featured/recommended"),
         Line::raw("  Esc               Clear query; on empty query quit"),
         Line::raw(""),

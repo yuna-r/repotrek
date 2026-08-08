@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Add per-entry browsing history deletion from the Home screen.
+- Add confirmed clearing of all local browsing history.
+
 ## 0.3.0 - 2026-08-08
 
 - Added persistent GitHub authentication and in-app PAT entry.

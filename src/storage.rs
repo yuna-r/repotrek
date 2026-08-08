@@ -90,6 +90,28 @@ impl HistoryStore {
         self.save()
     }
 
+    pub fn remove_repository(&mut self, repository_id: &RepositoryId) -> Result<bool> {
+        let full_name = repository_id.full_name();
+        let previous_len = self.entries.len();
+        self.entries.retain(|entry| {
+            !entry
+                .repository
+                .id
+                .full_name()
+                .eq_ignore_ascii_case(&full_name)
+        });
+        let removed = self.entries.len() != previous_len;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.entries.clear();
+        self.save()
+    }
+
     pub fn update_location(
         &mut self,
         repository_id: &RepositoryId,

@@ -331,6 +331,7 @@ pub enum CodeSearchMode {
 #[derive(Debug, Clone)]
 pub enum Modal {
     Help,
+    ConfirmClearHistory,
     Settings {
         index: usize,
     },
@@ -388,6 +389,8 @@ pub enum AppCommand {
         resume_screen: HistoryScreen,
     },
     RefreshHome,
+    DeleteHistory(RepositoryId),
+    ClearHistory,
     SearchRepositories(String),
     OpenDirectory(String),
     OpenFile {
@@ -990,6 +993,18 @@ impl App {
                     AppCommand::None
                 }
             },
+            Modal::ConfirmClearHistory => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    AppCommand::ClearHistory
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                    AppCommand::None
+                }
+                _ => {
+                    self.modal = Some(Modal::ConfirmClearHistory);
+                    AppCommand::None
+                }
+            },
             Modal::Settings { mut index } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => AppCommand::None,
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
@@ -1498,6 +1513,26 @@ impl App {
         if self.home.focus == HomeFocus::Search {
             return self.handle_home_search_key(key);
         }
+        if self.home.focus == HomeFocus::History
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('d')
+        {
+            if !self.home.history.is_empty() {
+                self.modal = Some(Modal::ConfirmClearHistory);
+            }
+            return AppCommand::None;
+        }
+
+        if self.home.focus == HomeFocus::History && key.code == KeyCode::Char('d') {
+            return self
+                .home
+                .history
+                .get(self.home.history_index)
+                .map_or(AppCommand::None, |entry| {
+                    AppCommand::DeleteHistory(entry.repository.id.clone())
+                });
+        }
+
         match key.code {
             KeyCode::Char('q') => AppCommand::Quit,
             KeyCode::Char('/') => {
