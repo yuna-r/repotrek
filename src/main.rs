@@ -1,15 +1,18 @@
 mod app;
 mod auth;
 mod cli;
+mod clipboard;
+mod diff;
 mod export;
 mod highlight;
 mod icons;
 mod model;
 mod provider;
 mod storage;
+mod symbols;
 mod ui;
 
-use std::{str::FromStr, time::Duration};
+use std::{process::Command, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -18,7 +21,7 @@ use crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
 
 use crate::{
-    app::{App, AppCommand},
+    app::{App, AppCommand, CodeSearchMode, RepositoryTab},
     cli::Cli,
     icons::Icons,
     model::{ApiResponse, HistoryScreen, RepositoryId},
@@ -29,7 +32,8 @@ use crate::{
 fn main() -> Result<()> {
     install_panic_hook();
     let cli = Cli::parse();
-    let token = auth::token_from_environment(cli.anonymous);
+    let token = auth::token_from_environment(cli.anonymous)
+        .or_else(|| auth::token_from_keychain(cli.anonymous));
     let mut provider = GitHubProvider::new(token)?;
     let mut history = HistoryStore::load()?;
     let icons = Icons::new(cli.emoji);
@@ -39,7 +43,7 @@ fn main() -> Result<()> {
         provider.is_authenticated(),
     );
 
-    let mut terminal = ratatui::try_init().context("ターミナルを初期化できません")?;
+    let mut terminal = ratatui::try_init().context("Could not initialize terminal")?;
     let result = run(
         &mut terminal,
         &mut app,
@@ -48,7 +52,7 @@ fn main() -> Result<()> {
         cli.repository,
         cli.no_home_refresh,
     );
-    let restore_result = ratatui::try_restore().context("ターミナルを復元できません");
+    let restore_result = ratatui::try_restore().context("Could not restore terminal");
 
     match (result, restore_result) {
         (Err(error), _) => Err(error),
@@ -87,6 +91,7 @@ fn run(
     }
 
     loop {
+        app.expire_status();
         terminal.draw(|frame| ui::draw(frame, app))?;
         if !event::poll(Duration::from_millis(120))? {
             continue;
@@ -100,6 +105,7 @@ fn run(
                 }
                 execute_command(command, app, provider, history, terminal)?;
             }
+            Event::Paste(text) => app.handle_paste(text),
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -120,27 +126,35 @@ fn execute_command(
             id,
             resume_path,
             resume_screen,
-        } => {
-            open_repository(
-                id,
-                resume_path,
-                resume_screen,
-                command,
+        } => open_repository(
+            id,
+            resume_path,
+            resume_screen,
+            command,
+            app,
+            provider,
+            history,
+            terminal,
+        )?,
+        AppCommand::RefreshHome => refresh_home(command, app, provider, history, terminal)?,
+        AppCommand::SearchRepositories(query) => {
+            let results = request(
                 app,
-                provider,
-                history,
                 terminal,
+                format!("Searching repositories: {query}"),
+                command,
+                || provider.search_repositories(&query, "stars", 30),
             )?;
-        }
-        AppCommand::RefreshHome => {
-            refresh_home(command, app, provider, history, terminal)?;
+            if let Some(results) = results {
+                app.set_repository_search_results(query, results);
+            }
         }
         AppCommand::OpenDirectory(path) => {
             let Some(repository) = app.repository.as_ref() else {
                 return Ok(());
             };
             let id = repository.repository.id.clone();
-            let git_ref = repository.repository.default_branch.clone();
+            let git_ref = repository.selected_ref.clone();
             let entries = request(
                 app,
                 terminal,
@@ -153,26 +167,29 @@ fn execute_command(
                 update_history_location(app, history, &id, Some(path), HistoryScreen::Code);
             }
         }
-        AppCommand::OpenFile(path) => {
+        AppCommand::OpenFile { path, find } => {
             let Some(repository) = app.repository.as_ref() else {
                 return Ok(());
             };
             let id = repository.repository.id.clone();
-            let git_ref = repository.repository.default_branch.clone();
+            let git_ref = repository.selected_ref.clone();
             let content = request(app, terminal, format!("Loading {path}"), command, || {
                 provider.file_content(&id, &path, &git_ref)
             })?;
             if let Some(content) = content {
-                app.open_file(path.clone(), content);
+                app.open_file(path.clone(), content, find.as_deref());
                 update_history_location(app, history, &id, Some(path), HistoryScreen::File);
             }
+        }
+        AppCommand::LoadRepositoryTab(tab) => {
+            load_repository_tab(tab, command, app, provider, terminal)?;
         }
         AppCommand::LoadCommits { page } => {
             let Some(repository) = app.repository.as_ref() else {
                 return Ok(());
             };
             let id = repository.repository.id.clone();
-            let git_ref = repository.repository.default_branch.clone();
+            let git_ref = repository.selected_ref.clone();
             let commits = request(
                 app,
                 terminal,
@@ -182,7 +199,7 @@ fn execute_command(
             )?;
             if let Some(commits) = commits {
                 if commits.is_empty() && page > 1 {
-                    app.status = Some("No more commits".to_owned());
+                    app.set_status("No more commits");
                 } else {
                     app.set_commits(page, commits);
                     update_history_location(app, history, &id, None, HistoryScreen::Commits);
@@ -206,25 +223,148 @@ fn execute_command(
                 update_history_location(app, history, &id, Some(sha), HistoryScreen::Commit);
             }
         }
-        AppCommand::Authenticate => {
-            authenticate(app, provider, history, terminal)?;
+        AppCommand::LoadBranches => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let branches = request(
+                app,
+                terminal,
+                "Loading branches".to_owned(),
+                command,
+                || provider.branches(&id),
+            )?;
+            if let Some(branches) = branches {
+                app.set_branches(branches);
+            }
         }
+        AppCommand::SwitchBranch(branch) => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            // Switching at the repository root is predictable even when the path currently
+            // being viewed does not exist on the target branch.
+            let root = String::new();
+            let entries = request(
+                app,
+                terminal,
+                format!("Switching to {branch}"),
+                command,
+                || provider.contents(&id, &root, &branch),
+            )?;
+            if let Some(entries) = entries {
+                app.switch_branch(branch.clone(), root, entries);
+                app.set_status(format!("Switched to branch {branch}"));
+            }
+        }
+        AppCommand::LoadTreeForSearch => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let git_ref = repository.selected_ref.clone();
+            let tree = request(
+                app,
+                terminal,
+                "Loading repository file index".to_owned(),
+                command,
+                || provider.tree(&id, &git_ref),
+            )?;
+            if let Some(tree) = tree {
+                app.set_tree_and_open_search(tree);
+            }
+        }
+        AppCommand::SearchCode { query, mode } => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let results = request(
+                app,
+                terminal,
+                format!("Searching code: {query}"),
+                command,
+                || provider.search_code(&id, &query, 100),
+            )?;
+            if let Some(results) = results {
+                app.set_code_search_results(query, mode, results);
+            }
+        }
+        AppCommand::LoadBlame => {
+            let (id, git_ref) = match app.repository.as_ref() {
+                Some(repository) => (
+                    repository.repository.id.clone(),
+                    repository.selected_ref.clone(),
+                ),
+                None => return Ok(()),
+            };
+            let path = match app.file.as_ref() {
+                Some(file) => file.path.clone(),
+                None => return Ok(()),
+            };
+            let ranges = request(
+                app,
+                terminal,
+                format!("Loading blame for {path}"),
+                command,
+                || provider.blame(&id, &git_ref, &path),
+            )?;
+            if let Some(ranges) = ranges {
+                app.set_blame(ranges);
+            }
+        }
+        AppCommand::LoadFileHistory => {
+            let (id, git_ref) = match app.repository.as_ref() {
+                Some(repository) => (
+                    repository.repository.id.clone(),
+                    repository.selected_ref.clone(),
+                ),
+                None => return Ok(()),
+            };
+            let path = match app.file.as_ref() {
+                Some(file) => file.path.clone(),
+                None => return Ok(()),
+            };
+            let commits = request(
+                app,
+                terminal,
+                format!("Loading history for {path}"),
+                command,
+                || provider.file_history(&id, &git_ref, &path, 1, 100),
+            )?;
+            if let Some(commits) = commits {
+                app.set_file_history(commits);
+            }
+        }
+        AppCommand::AuthenticateCli => authenticate_cli(app, provider, history, terminal)?,
+        AppCommand::SetToken { token, persist } => {
+            set_token(token, persist, app, provider, history, terminal)?;
+        }
+        AppCommand::CopyText(text) => match clipboard::copy_text(&text) {
+            Ok(()) => app.set_status(format!(
+                "Copied {} chars to clipboard",
+                text.chars().count()
+            )),
+            Err(error) => app.show_error("Clipboard", error.to_string()),
+        },
+        AppCommand::PasteClipboard => match clipboard::paste_text() {
+            Ok(text) => app.handle_paste(text),
+            Err(error) => app.show_error("Clipboard", error.to_string()),
+        },
         AppCommand::ExportFile => {
             let Some(repository) = app.current_repository() else {
+                return Ok(());
+            };
+            let Some(git_ref) = app.current_ref() else {
                 return Ok(());
             };
             let Some(file) = app.file.as_ref() else {
                 return Ok(());
             };
-            match export::export_file(
-                repository,
-                &repository.default_branch,
-                &file.path,
-                &file.content,
-            ) {
-                Ok(path) => {
-                    app.status = Some(format!("Exported {}", path.display()));
-                }
+            match export::export_file(repository, git_ref, &file.path, &file.content) {
+                Ok(path) => app.set_status(format!("Exported {}", path.display())),
                 Err(error) => app.show_error("Print export", error.to_string()),
             }
         }
@@ -236,10 +376,78 @@ fn execute_command(
                 return Ok(());
             };
             match export::export_commit(repository, &commit.detail) {
-                Ok(path) => {
-                    app.status = Some(format!("Exported {}", path.display()));
-                }
+                Ok(path) => app.set_status(format!("Exported {}", path.display())),
                 Err(error) => app.show_error("Print export", error.to_string()),
+            }
+        }
+        AppCommand::OpenExternal(url) => match open_external(&url) {
+            Ok(()) => app.set_status("Opened in browser"),
+            Err(error) => app.show_error("Open browser", error.to_string()),
+        },
+    }
+    Ok(())
+}
+
+fn load_repository_tab(
+    tab: RepositoryTab,
+    retry: AppCommand,
+    app: &mut App,
+    provider: &GitHubProvider,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    let Some(repository) = app.repository.as_ref() else {
+        return Ok(());
+    };
+    let id = repository.repository.id.clone();
+    let git_ref = repository.selected_ref.clone();
+    match tab {
+        RepositoryTab::Code => {}
+        RepositoryTab::Commits => {
+            let commits = request(app, terminal, "Loading commits".to_owned(), retry, || {
+                provider.commits(&id, &git_ref, 1, 50)
+            })?;
+            if let Some(commits) = commits {
+                app.set_commits(1, commits);
+            }
+        }
+        RepositoryTab::PullRequests => {
+            let values = request(
+                app,
+                terminal,
+                "Loading pull requests".to_owned(),
+                retry,
+                || provider.pull_requests(&id),
+            )?;
+            if let Some(values) = values {
+                app.set_pull_requests(values);
+            }
+        }
+        RepositoryTab::Issues => {
+            let values = request(app, terminal, "Loading issues".to_owned(), retry, || {
+                provider.issues(&id)
+            })?;
+            if let Some(values) = values {
+                app.set_issues(values);
+            }
+        }
+        RepositoryTab::Actions => {
+            let values = request(
+                app,
+                terminal,
+                "Loading workflow runs".to_owned(),
+                retry,
+                || provider.workflow_runs(&id, &git_ref),
+            )?;
+            if let Some(values) = values {
+                app.set_workflow_runs(values);
+            }
+        }
+        RepositoryTab::Releases => {
+            let values = request(app, terminal, "Loading releases".to_owned(), retry, || {
+                provider.releases(&id)
+            })?;
+            if let Some(values) = values {
+                app.set_releases(values);
             }
         }
     }
@@ -287,7 +495,7 @@ fn open_repository(
 
     app.open_repository(repository.clone(), directory_path, entries);
     if let Err(error) = history.record_repository(&repository, resume_path.clone(), resume_screen) {
-        app.status = Some(format!("History save failed: {error}"));
+        app.set_status(format!("History save failed: {error}"));
     }
     app.update_history(history.entries().to_vec());
 
@@ -297,7 +505,7 @@ fn open_repository(
                 provider.file_content(&id, &path, &repository.default_branch)
             })?;
             if let Some(content) = content {
-                app.open_file(path, content);
+                app.open_file(path, content, None);
             }
         }
         (HistoryScreen::Commits, _) => {
@@ -322,7 +530,6 @@ fn open_repository(
         }
         (HistoryScreen::Code | HistoryScreen::File | HistoryScreen::Commit, _) => {}
     }
-
     Ok(())
 }
 
@@ -369,43 +576,90 @@ fn refresh_home(
             app.home.recommended = recommended;
             app.home.recommended_index = 0;
         }
-        app.status = Some("Recommendations refreshed".to_owned());
+        app.set_status("Recommendations refreshed");
     }
     Ok(())
 }
 
-fn authenticate(
+fn authenticate_cli(
     app: &mut App,
     provider: &mut GitHubProvider,
     history: &mut HistoryStore,
     terminal: &mut DefaultTerminal,
 ) -> Result<()> {
-    if app.authenticated {
-        app.show_error(
-            "GitHub API rate limit",
-            "すでに認証済みです。リセット時刻までキャッシュ済みデータを利用してください",
-        );
-        return Ok(());
-    }
-
-    ratatui::try_restore().context("認証前にターミナルを復元できません")?;
+    ratatui::try_restore().context("Could not restore terminal before authentication")?;
     println!("RepoTrek GitHub authentication");
-    println!("GitHub CLIのDevice Flowを開始します。使用するGitHubアカウントで承認してください。\n");
+    println!("Authorize RepoTrek through GitHub CLI in the browser.\n");
     let authentication = auth::authenticate_with_github_cli();
-    *terminal = ratatui::try_init().context("認証後にターミナルを再初期化できません")?;
+    *terminal =
+        ratatui::try_init().context("Could not reinitialize terminal after authentication")?;
 
     match authentication {
-        Ok(token) => {
-            provider.set_token(token);
+        Ok(token) => finish_token_auth(token, false, app, provider, history, terminal)?,
+        Err(error) => app.show_error("GitHub authentication", error.to_string()),
+    }
+    Ok(())
+}
+
+fn set_token(
+    token: String,
+    persist: bool,
+    app: &mut App,
+    provider: &mut GitHubProvider,
+    history: &mut HistoryStore,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    finish_token_auth(token, persist, app, provider, history, terminal)
+}
+
+fn finish_token_auth(
+    token: String,
+    persist: bool,
+    app: &mut App,
+    provider: &mut GitHubProvider,
+    history: &mut HistoryStore,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    provider.set_token(token.clone());
+    match provider.viewer_login() {
+        Ok(ApiResponse {
+            value: login,
+            rate_limit,
+        }) => {
+            app.update_rate_limit(rate_limit);
             app.authenticated = true;
-            app.status = Some("GitHub authentication enabled".to_owned());
+            app.auth_user = Some(login.clone());
             app.modal = None;
+
+            let keychain_warning = if persist {
+                auth::save_token_to_keychain(&token)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
+
             if let Some(retry) = app.pending_retry.take() {
                 execute_command(retry, app, provider, history, terminal)?;
             }
+
+            if let Some(warning) = keychain_warning {
+                app.set_status(format!(
+                    "Authenticated as @{login}; Keychain save failed: {warning}"
+                ));
+            } else if persist {
+                app.set_status(format!(
+                    "GitHub authentication enabled for @{login}; token saved in macOS Keychain"
+                ));
+            } else {
+                app.set_status(format!("GitHub authentication enabled for @{login}"));
+            }
         }
         Err(error) => {
-            app.show_error("GitHub authentication", error.to_string());
+            provider.clear_token();
+            app.authenticated = false;
+            app.auth_user = None;
+            app.show_error("GitHub token", format!("Token validation failed: {error}"));
         }
     }
     Ok(())
@@ -440,6 +694,15 @@ fn request<T>(
 
 fn handle_provider_error(app: &mut App, error: ProviderError, retry: AppCommand) {
     match error {
+        ProviderError::AuthenticationRequired { .. } if !app.authenticated => {
+            app.show_auth_required(retry);
+        }
+        ProviderError::AuthenticationRequired { .. } => {
+            app.show_error(
+                "GitHub authentication",
+                "The current token does not allow this operation",
+            );
+        }
         ProviderError::RateLimited(rate_limit) if !app.authenticated => {
             app.show_rate_limit(rate_limit, retry);
         }
@@ -450,7 +713,7 @@ fn handle_provider_error(app: &mut App, error: ProviderError, retry: AppCommand)
             );
             app.show_error(
                 "GitHub API rate limit",
-                format!("認証済みAPI上限に達しました。Reset: {reset}"),
+                format!("Authenticated API quota exhausted. Reset: {reset}"),
             );
         }
         ProviderError::TemporarilyLimited {
@@ -478,9 +741,25 @@ fn update_history_location(
     screen: HistoryScreen,
 ) {
     if let Err(error) = history.update_location(id, path, screen) {
-        app.status = Some(format!("History save failed: {error}"));
+        app.set_status(format!("History save failed: {error}"));
     }
     app.update_history(history.entries().to_vec());
+}
+
+fn open_external(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status()?;
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(url).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Browser command returned a non-zero status")
+    }
 }
 
 fn parent_path(path: &str) -> String {

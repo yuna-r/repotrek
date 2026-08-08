@@ -1,10 +1,10 @@
 [package]
 name = "repotrek"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 authors = ["Yuna <youzhilinqi@gmail.com>"]
-description = "A terminal-first source code browser for GitHub repositories"
+description = "A terminal-first GitHub source browser for reading repositories deeply"
 license = "MIT"
 repository = "https://github.com/yuna-r/repotrek"
 readme = "README.md"

@@ -3,41 +3,45 @@ pub mod github;
 use thiserror::Error;
 
 use crate::model::{
-    ApiResponse, CommitDetail, CommitSummary, ContentEntry, RateLimit, RepoCard, Repository,
-    RepositoryId,
+    ApiResponse, BlameRange, BranchSummary, CodeSearchResult, CommitDetail, CommitSummary,
+    ContentEntry, IssueSummary, PullRequestSummary, RateLimit, ReleaseSummary, RepoCard,
+    Repository, RepositoryId, TreeEntry, WorkflowRunSummary,
 };
 
 pub type ProviderResult<T> = Result<ApiResponse<T>, ProviderError>;
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
-    #[error("GitHubへの通信に失敗しました: {0}")]
+    #[error("Failed to communicate with GitHub: {0}")]
     Transport(#[from] reqwest::Error),
 
-    #[error("GitHub APIがHTTP {status}を返しました: {message}")]
+    #[error("GitHub API returned HTTP {status}: {message}")]
     Api {
         status: u16,
         message: String,
         rate_limit: RateLimit,
     },
 
-    #[error("匿名APIリクエスト上限に達しました")]
+    #[error("Anonymous GitHub API quota has been exhausted")]
     RateLimited(RateLimit),
 
-    #[error("GitHub APIが一時的なアクセス制限を返しました: {message}")]
+    #[error("This operation requires GitHub authentication")]
+    AuthenticationRequired { rate_limit: RateLimit },
+
+    #[error("GitHub API temporarily limited the request: {message}")]
     TemporarilyLimited {
         message: String,
         retry_after_seconds: Option<u64>,
         rate_limit: RateLimit,
     },
 
-    #[error("GitHub APIの応答を解釈できませんでした: {0}")]
+    #[error("Could not interpret the GitHub API response: {0}")]
     InvalidResponse(String),
 
-    #[error("{size}バイトのファイルはMVPの表示上限{limit}バイトを超えています")]
+    #[error("The file is {size} bytes, larger than the display limit of {limit} bytes")]
     FileTooLarge { size: usize, limit: usize },
 
-    #[error("このファイルはUTF-8テキストではありません")]
+    #[error("The selected file is not UTF-8 text")]
     BinaryFile,
 }
 
@@ -47,7 +51,8 @@ impl ProviderError {
         match self {
             Self::Api { rate_limit, .. }
             | Self::TemporarilyLimited { rate_limit, .. }
-            | Self::RateLimited(rate_limit) => Some(rate_limit),
+            | Self::RateLimited(rate_limit)
+            | Self::AuthenticationRequired { rate_limit } => Some(rate_limit),
             Self::Transport(_)
             | Self::InvalidResponse(_)
             | Self::FileTooLarge { .. }
@@ -68,6 +73,10 @@ pub trait RepositoryProvider {
 
     fn file_content(&self, id: &RepositoryId, path: &str, git_ref: &str) -> ProviderResult<String>;
 
+    fn branches(&self, id: &RepositoryId) -> ProviderResult<Vec<BranchSummary>>;
+
+    fn tree(&self, id: &RepositoryId, git_ref: &str) -> ProviderResult<Vec<TreeEntry>>;
+
     fn commits(
         &self,
         id: &RepositoryId,
@@ -76,7 +85,23 @@ pub trait RepositoryProvider {
         per_page: u32,
     ) -> ProviderResult<Vec<CommitSummary>>;
 
+    fn file_history(
+        &self,
+        id: &RepositoryId,
+        git_ref: &str,
+        path: &str,
+        page: u32,
+        per_page: u32,
+    ) -> ProviderResult<Vec<CommitSummary>>;
+
     fn commit(&self, id: &RepositoryId, sha: &str) -> ProviderResult<CommitDetail>;
+
+    fn blame(
+        &self,
+        id: &RepositoryId,
+        git_ref: &str,
+        path: &str,
+    ) -> ProviderResult<Vec<BlameRange>>;
 
     fn search_repositories(
         &self,
@@ -84,4 +109,25 @@ pub trait RepositoryProvider {
         sort: &str,
         per_page: u32,
     ) -> ProviderResult<Vec<RepoCard>>;
+
+    fn search_code(
+        &self,
+        id: &RepositoryId,
+        query: &str,
+        per_page: u32,
+    ) -> ProviderResult<Vec<CodeSearchResult>>;
+
+    fn pull_requests(&self, id: &RepositoryId) -> ProviderResult<Vec<PullRequestSummary>>;
+
+    fn issues(&self, id: &RepositoryId) -> ProviderResult<Vec<IssueSummary>>;
+
+    fn workflow_runs(
+        &self,
+        id: &RepositoryId,
+        git_ref: &str,
+    ) -> ProviderResult<Vec<WorkflowRunSummary>>;
+
+    fn releases(&self, id: &RepositoryId) -> ProviderResult<Vec<ReleaseSummary>>;
+
+    fn viewer_login(&self) -> ProviderResult<String>;
 }

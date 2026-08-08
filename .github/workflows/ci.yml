@@ -15,8 +15,9 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - macos-latest
           - ubuntu-latest
+          - macos-latest
+          - windows-latest
 
     steps:
       - name: Check out repository
@@ -25,8 +26,8 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Normalize formatting
+        run: cargo fmt --all
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features

@@ -6,21 +6,21 @@ use crate::icons::EmojiMode;
 #[command(
     name = "repotrek",
     version,
-    about = "A terminal-first source code browser for GitHub repositories"
+    about = "A terminal-first GitHub source browser for reading repositories deeply"
 )]
 pub struct Cli {
-    /// owner/repo、GitHub URL、またはgit@github.com形式
+    /// owner/repo, a GitHub URL, or git@github.com:owner/repo.git
     pub repository: Option<String>,
 
-    /// 絵文字表示を自動判定・強制有効・無効にします
+    /// Detect, force-enable, or disable emoji rendering
     #[arg(long, value_enum, default_value_t = EmojiMode::Auto)]
     pub emoji: EmojiMode,
 
-    /// 環境変数のGitHub tokenも使わず、必ず匿名で開始します
+    /// Ignore environment and Keychain tokens and start anonymously
     #[arg(long)]
     pub anonymous: bool,
 
-    /// 起動時のFeatured／Recommended更新を省略します
+    /// Skip Featured and Recommended refresh at startup
     #[arg(long)]
     pub no_home_refresh: bool,
 }

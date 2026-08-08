@@ -6,7 +6,11 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::Local;
 
-use crate::model::{CommitDetail, Repository};
+use crate::{
+    diff::{DiffKind, parse_patch},
+    highlight::source_html,
+    model::{CommitDetail, Repository},
+};
 
 pub fn export_file(
     repository: &Repository,
@@ -14,247 +18,273 @@ pub fn export_file(
     path: &str,
     content: &str,
 ) -> Result<PathBuf> {
-    let file_name = format!(
-        "repotrek-export-{}-{}.html",
+    let filename = format!(
+        "repotrek-{}-{}.html",
         sanitize_filename(&repository.full_name),
         sanitize_filename(path)
     );
-    let output = std::env::current_dir()?.join(file_name);
-
+    let output = std::env::current_dir()?.join(filename);
+    let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     let rows = content
         .lines()
         .enumerate()
         .map(|(index, line)| {
             format!(
-                "<tr><td class=\"line-number\">{}</td><td class=\"source\"><code>{}</code></td></tr>",
+                "<tr><td class=\"ln\">{}</td><td class=\"code\"><code>{}</code></td></tr>",
                 index + 1,
-                escape_html(line)
+                source_html(line, extension)
             )
         })
-        .collect::<String>();
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let title = format!("{} · {path}", repository.full_name);
     let body = format!(
-        r#"<header>
-  <div class="eyebrow">RepoTrek source export</div>
-  <h1>{}</h1>
-  <div class="metadata">
-    <span>Repository: <a href="{}">{}</a></span>
-    <span>Branch: {}</span>
-    <span>Exported: {}</span>
+        r#"
+<header class="doc-header">
+  <div>
+    <div class="repo">{repo}</div>
+    <div class="path">{path}</div>
   </div>
+  <div class="meta">branch <strong>{git_ref}</strong><br>{generated}</div>
 </header>
-<main>
-  <table class="code-table"><tbody>{rows}</tbody></table>
-</main>"#,
-        escape_html(path),
-        escape_html(&repository.html_url),
-        escape_html(&repository.full_name),
-        escape_html(git_ref),
-        Local::now().format("%Y-%m-%d %H:%M:%S %Z"),
+<section class="summary">
+  <span>{line_count} lines</span>
+  <span>source snapshot</span>
+</section>
+<div class="code-frame"><table class="source-table"><thead><tr><th class="ln">Line</th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>
+"#,
+        repo = escape_html(&repository.full_name),
+        path = escape_html(path),
+        git_ref = escape_html(git_ref),
+        generated = Local::now().format("%Y-%m-%d %H:%M %Z"),
+        line_count = content.lines().count(),
     );
-
-    write_html(&output, &title, &body)?;
+    write_document(
+        &output,
+        &format!("{} · {}", repository.full_name, path),
+        &body,
+    )?;
     Ok(output)
 }
 
 pub fn export_commit(repository: &Repository, detail: &CommitDetail) -> Result<PathBuf> {
-    let file_name = format!(
-        "repotrek-export-{}-commit-{}.html",
+    let filename = format!(
+        "repotrek-{}-commit-{}.html",
         sanitize_filename(&repository.full_name),
-        detail.summary.short_sha()
+        sanitize_filename(detail.summary.short_sha())
     );
-    let output = std::env::current_dir()?.join(file_name);
+    let output = std::env::current_dir()?.join(filename);
+    let mut files_html = String::new();
 
-    let files = detail
-        .files
-        .iter()
-        .map(|file| {
-            let patch = file.patch.as_deref().map_or_else(
-                || {
-                    "<p class=\"notice\">GitHub APIの応答にpatch本文が含まれていません。</p>"
-                        .to_owned()
-                },
-                render_patch,
-            );
-            format!(
-                r#"<section class="diff-file">
-  <h2>{}</h2>
-  <div class="file-stats">{} · +{} −{} · {} changes</div>
-  <div class="diff">{patch}</div>
-</section>"#,
-                escape_html(&file.filename),
-                escape_html(&file.status),
-                file.additions,
-                file.deletions,
-                file.changes,
-            )
-        })
-        .collect::<String>();
+    for file in &detail.files {
+        let extension = file
+            .filename
+            .rsplit_once('.')
+            .map_or("", |(_, extension)| extension);
+        let diff_html = file.patch.as_deref().map_or_else(
+            || "<p class=\"muted\">Diff omitted by GitHub API for this file.</p>".to_owned(),
+            |patch| {
+                let rows = parse_patch(patch)
+                    .into_iter()
+                    .map(|line| match line.kind {
+                        DiffKind::Hunk => format!(
+                            "<tr class=\"hunk\"><td colspan=\"4\"><code>{}</code></td></tr>",
+                            escape_html(&line.text)
+                        ),
+                        DiffKind::Meta => format!(
+                            "<tr class=\"meta-line\"><td colspan=\"4\"><code>{}</code></td></tr>",
+                            escape_html(&line.text)
+                        ),
+                        kind => {
+                            let old = line.old_line.map_or_else(String::new, |value| value.to_string());
+                            let new = line.new_line.map_or_else(String::new, |value| value.to_string());
+                            let (class, sign) = match kind {
+                                DiffKind::Add => ("add", "+"),
+                                DiffKind::Delete => ("del", "-"),
+                                DiffKind::Context => ("ctx", " "),
+                                DiffKind::Hunk | DiffKind::Meta => unreachable!(),
+                            };
+                            format!(
+                                "<tr class=\"{class}\"><td class=\"ln old\">{old}</td><td class=\"ln new\">{new}</td><td class=\"sign\">{sign}</td><td class=\"code\"><code>{code}</code></td></tr>",
+                                code = source_html(&line.text, extension)
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("<div class=\"code-frame\"><table class=\"diff-table\"><thead><tr><th class=\"ln\">Old</th><th class=\"ln\">New</th><th class=\"sign\"></th><th>Source</th></tr></thead><tbody>{rows}</tbody></table></div>")
+            },
+        );
+        files_html.push_str(&format!(
+            r#"
+<section class="file-section">
+  <h2>{filename}</h2>
+  <div class="file-stats"><span class="plus">+{additions}</span><span class="minus">-{deletions}</span><span>{status}</span></div>
+  {diff_html}
+</section>
+"#,
+            filename = escape_html(&file.filename),
+            additions = file.additions,
+            deletions = file.deletions,
+            status = escape_html(&file.status),
+        ));
+    }
 
-    let body_text = if detail.summary.body.trim().is_empty() {
-        String::new()
+    let parents = if detail.summary.parent_shas.is_empty() {
+        "none".to_owned()
     } else {
-        format!(
-            "<pre class=\"commit-body\">{}</pre>",
-            escape_html(&detail.summary.body)
-        )
+        detail
+            .summary
+            .parent_shas
+            .iter()
+            .map(|sha| escape_html(sha.get(..7).unwrap_or(sha)))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
-
+    let verified = if detail.summary.verified {
+        "Verified"
+    } else {
+        "Unverified"
+    };
     let body = format!(
-        r#"<header>
-  <div class="eyebrow">RepoTrek commit export</div>
-  <h1>{}</h1>
-  <div class="metadata">
-    <span>Repository: <a href="{}">{}</a></span>
-    <span>Commit: <a href="{}">{}</a></span>
-    <span>Author: {}</span>
-    <span>Exported: {}</span>
+        r#"
+<header class="doc-header">
+  <div>
+    <div class="repo">{repo}</div>
+    <div class="path">Commit {short_sha}</div>
   </div>
+  <div class="meta">{generated}</div>
 </header>
-<main>
-  <section class="commit-summary">
-    {body_text}
-    <p><strong>{} files</strong> · <span class="add">+{}</span> · <span class="del">−{}</span> · {} total changes</p>
-  </section>
-  {files}
-</main>"#,
-        escape_html(&detail.summary.title),
-        escape_html(&repository.html_url),
-        escape_html(&repository.full_name),
-        escape_html(&detail.summary.html_url),
-        escape_html(&detail.summary.sha),
-        escape_html(&detail.summary.author_name),
-        Local::now().format("%Y-%m-%d %H:%M:%S %Z"),
-        detail.files.len(),
-        detail.stats.additions,
-        detail.stats.deletions,
-        detail.stats.total,
+<article class="commit-card">
+  <h1>{title}</h1>
+  <dl>
+    <dt>Author</dt><dd>{author}</dd>
+    <dt>Commit</dt><dd><code>{sha}</code></dd>
+    <dt>Parent</dt><dd><code>{parents}</code></dd>
+    <dt>Signature</dt><dd>{verified}</dd>
+    <dt>Changes</dt><dd><span class="plus">+{additions}</span> <span class="minus">-{deletions}</span> across {file_count} files</dd>
+  </dl>
+  <pre class="message">{message}</pre>
+</article>
+{files_html}
+"#,
+        repo = escape_html(&repository.full_name),
+        short_sha = escape_html(detail.summary.short_sha()),
+        generated = Local::now().format("%Y-%m-%d %H:%M %Z"),
+        title = escape_html(&detail.summary.title),
+        author = escape_html(&detail.summary.author_name),
+        sha = escape_html(&detail.summary.sha),
+        message = escape_html(&detail.summary.body),
+        additions = detail.stats.additions,
+        deletions = detail.stats.deletions,
+        file_count = detail.files.len(),
     );
-
-    let title = format!(
-        "{} · commit {}",
-        repository.full_name,
-        detail.summary.short_sha()
-    );
-    write_html(&output, &title, &body)?;
+    write_document(
+        &output,
+        &format!("{} · {}", repository.full_name, detail.summary.short_sha()),
+        &body,
+    )?;
     Ok(output)
 }
 
-fn render_patch(patch: &str) -> String {
-    patch
-        .lines()
-        .map(|line| {
-            let class = if line.starts_with("+++") || line.starts_with("---") {
-                "diff-meta"
-            } else if line.starts_with('+') {
-                "diff-add"
-            } else if line.starts_with('-') {
-                "diff-del"
-            } else if line.starts_with("@@") {
-                "diff-hunk"
-            } else {
-                "diff-context"
-            };
-            format!("<span class=\"{class}\">{}</span>\n", escape_html(line))
-        })
-        .collect()
-}
-
-fn write_html(path: &Path, title: &str, body: &str) -> Result<()> {
+fn write_document(path: &Path, title: &str, body: &str) -> Result<()> {
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{}</title>
+<title>{title}</title>
 <style>
-:root {{ color-scheme: light; --ink:#1f2328; --muted:#59636e; --line:#d0d7de; --soft:#f6f8fa; --add:#1a7f37; --add-bg:#dafbe1; --del:#cf222e; --del-bg:#ffebe9; --accent:#0969da; }}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; color:var(--ink); background:white; font:11pt/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-header, main {{ max-width:1160px; margin:0 auto; padding:24px 32px; }}
-header {{ border-bottom:1px solid var(--line); }}
-.eyebrow {{ color:var(--accent); font-size:9pt; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }}
-h1 {{ margin:.25rem 0 .5rem; font-size:20pt; line-height:1.2; overflow-wrap:anywhere; }}
-h2 {{ margin:0; font:600 11pt ui-monospace,SFMono-Regular,Menlo,monospace; overflow-wrap:anywhere; }}
-.metadata {{ display:flex; flex-wrap:wrap; gap:.35rem 1rem; color:var(--muted); font-size:9pt; }}
-.code-table {{ width:100%; border-collapse:collapse; table-layout:fixed; font:8.6pt/1.42 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
-.code-table tr {{ break-inside:avoid; }}
-.line-number {{ width:4.7rem; padding:0 .8rem; color:var(--muted); background:var(--soft); border-right:1px solid var(--line); text-align:right; vertical-align:top; user-select:none; }}
-.source {{ padding:0 .8rem; white-space:pre-wrap; overflow-wrap:anywhere; vertical-align:top; }}
-.commit-summary {{ margin-bottom:1.5rem; padding:1rem 1.2rem; background:var(--soft); border:1px solid var(--line); border-radius:6px; }}
-.commit-body {{ margin:.7rem 0; white-space:pre-wrap; font:9.3pt/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }}
-.diff-file {{ margin:0 0 1.5rem; border:1px solid var(--line); border-radius:6px; overflow:hidden; break-inside:auto; }}
-.diff-file h2, .file-stats {{ padding:.55rem .8rem; background:var(--soft); }}
-.file-stats {{ padding-top:0; color:var(--muted); font-size:8.7pt; }}
-.diff {{ margin:0; padding:.7rem 0; overflow-wrap:anywhere; white-space:pre-wrap; font:8.2pt/1.38 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }}
-.diff span {{ display:block; padding:0 .8rem; border-left:3px solid transparent; }}
-.diff-add {{ background:var(--add-bg); border-left-color:var(--add)!important; }}
-.diff-del {{ background:var(--del-bg); border-left-color:var(--del)!important; }}
-.diff-hunk {{ color:#8250df; background:#fbefff; font-weight:600; }}
-.diff-meta {{ color:var(--muted); font-weight:600; }}
-.add {{ color:var(--add); }} .del {{ color:var(--del); }}
-.notice {{ margin:.7rem .8rem; color:var(--muted); }}
-@page {{ size:A4 portrait; margin:13mm 10mm 15mm; }}
+:root {{ color-scheme: light; }}
+* {{ box-sizing: border-box; }}
+html {{ background: #f6f8fa; }}
+body {{
+  margin: 0 auto;
+  max-width: 1280px;
+  padding: 28px 34px 60px;
+  color: #1f2328;
+  background: #fff;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+.doc-header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-start; padding-bottom:18px; border-bottom:1px solid #d0d7de; margin-bottom:18px; }}
+.repo {{ font-size:20px; font-weight:700; color:#0969da; }}
+.path {{ margin-top:4px; font-size:16px; font-weight:600; overflow-wrap:anywhere; }}
+.meta {{ color:#57606a; text-align:right; font-size:12px; white-space:nowrap; }}
+.summary, .file-stats {{ display:flex; gap:18px; color:#57606a; margin:10px 0; }}
+.commit-card {{ border:1px solid #d0d7de; border-radius:8px; padding:18px 22px; margin-bottom:24px; break-inside:avoid; }}
+.commit-card h1 {{ font-size:20px; margin:0 0 14px; }}
+dl {{ display:grid; grid-template-columns:90px 1fr; gap:5px 12px; margin:0; }} dt {{ color:#57606a; }} dd {{ margin:0; }}
+.message {{ white-space:pre-wrap; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#f6f8fa; border-radius:6px; padding:12px; }}
+.file-section {{ margin:26px 0 34px; break-before:auto; }}
+.file-section h2 {{ font:600 15px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin:0; padding:10px 12px; background:#f6f8fa; border:1px solid #d0d7de; border-bottom:0; border-radius:6px 6px 0 0; overflow-wrap:anywhere; }}
+.code-frame {{ width:100%; overflow-x:auto; border:1px solid #d0d7de; border-radius:6px; background:#fff; }}
+.source-table, .diff-table {{ width:100%; border-collapse:collapse; table-layout:auto; }}
+.source-table thead, .diff-table thead {{ display:table-header-group; }}
+.source-table th, .diff-table th {{ padding:5px 10px; text-align:left; color:#57606a; background:#f6f8fa; border-bottom:1px solid #d0d7de; font:600 11px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+.source-table td, .diff-table td {{ padding:0; vertical-align:top; border-bottom:1px solid #f0f1f2; }}
+.ln {{ width:58px; min-width:58px; padding:0 10px !important; text-align:right !important; user-select:none; color:#6e7781; background:#f6f8fa; border-right:1px solid #d8dee4; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.diff-table .ln {{ width:52px; min-width:52px; }}
+.sign {{ width:28px; min-width:28px; text-align:center !important; color:#6e7781; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.code {{ padding:0 12px !important; }}
+.code code, .hunk code, .meta-line code {{ white-space:pre; tab-size:4; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.hunk td {{ padding:4px 10px !important; color:#0550ae; background:#ddf4ff; border-top:1px solid #b6e3ff; border-bottom:1px solid #b6e3ff; }}
+.meta-line td {{ padding:3px 10px !important; color:#6e7781; }}
+.add td {{ background:#e6ffec; }} .del td {{ background:#ffebe9; }}
+.plus {{ color:#1a7f37; font-weight:650; }} .minus {{ color:#cf222e; font-weight:650; }} .muted {{ color:#6e7781; }}
 @media print {{
-  body {{ font-size:9pt; print-color-adjust:exact; -webkit-print-color-adjust:exact; }}
-  header, main {{ max-width:none; padding:0; }}
-  header {{ margin-bottom:5mm; }}
+  @page {{ size: A4 landscape; margin: 10mm; }}
+  html, body {{ background:#fff !important; }}
+  body {{ max-width:none; padding:0; font-size:10pt; -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+  .doc-header {{ margin-bottom:4mm; }}
+  .repo {{ font-size:14pt; }} .path {{ font-size:11pt; }}
+  .code-frame {{ overflow:visible; border-color:#aeb6bf; }}
+  .source-table, .diff-table {{ font-size:8.6pt; }}
+  .source-table th, .diff-table th {{ font-size:7.6pt; }}
+  .code code, .hunk code, .meta-line code, .ln, .sign {{ font-size:8.3pt; line-height:1.42; }}
+  .code code {{ white-space:pre-wrap; overflow-wrap:anywhere; }}
+  .file-section {{ break-inside:auto; margin:5mm 0 7mm; }}
+  .file-section h2 {{ break-after:avoid; }}
+  thead {{ break-after:avoid; }}
+  tr {{ break-inside:avoid; }}
   a {{ color:inherit; text-decoration:none; }}
-  .diff-file {{ break-before:auto; }}
-  .diff-file h2 {{ break-after:avoid; }}
-  .code-table {{ font-size:7.4pt; }}
-  .line-number {{ width:12mm; }}
 }}
 </style>
 </head>
 <body>{body}</body>
-</html>
-"#,
-        escape_html(title)
+</html>"#,
+        title = escape_html(title),
     );
-
-    fs::write(path, html).with_context(|| format!("HTMLを書き出せません: {}", path.display()))
+    fs::write(path, html).with_context(|| format!("Could not write HTML: {}", path.display()))
 }
 
 fn sanitize_filename(value: &str) -> String {
-    let sanitized = value
+    value
         .chars()
         .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
                 character
             } else {
                 '-'
             }
         })
-        .collect::<String>();
-    sanitized.trim_matches('-').to_owned()
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned()
 }
 
 fn escape_html(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_html, sanitize_filename};
-
-    #[test]
-    fn escapes_html() {
-        assert_eq!(escape_html("<a&\"b\">"), "&lt;a&amp;&quot;b&quot;&gt;");
-    }
+    use super::sanitize_filename;
 
     #[test]
     fn sanitizes_paths() {

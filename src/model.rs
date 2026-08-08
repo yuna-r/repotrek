@@ -26,9 +26,9 @@ impl fmt::Display for RepositoryId {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RepositoryIdParseError {
-    #[error("リポジトリを owner/repo または GitHub URL で入力してください")]
+    #[error("Enter owner/repo or a GitHub repository URL")]
     InvalidFormat,
-    #[error("現在のMVPが直接閲覧できるリモートは github.com です")]
+    #[error("The GitHub provider currently supports github.com URLs")]
     UnsupportedHost,
 }
 
@@ -44,11 +44,9 @@ impl FromStr for RepositoryId {
         if let Some(rest) = value.strip_prefix("git@github.com:") {
             return parse_owner_repo(rest);
         }
-
         if let Some(rest) = value.strip_prefix("github.com/") {
             return parse_owner_repo(rest);
         }
-
         if value.contains("://") {
             let url = Url::parse(value).map_err(|_| RepositoryIdParseError::InvalidFormat)?;
             let host = url
@@ -100,6 +98,13 @@ pub struct Repository {
     pub is_private: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchSummary {
+    pub name: String,
+    pub sha: String,
+    pub protected: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentKind {
     Directory,
@@ -128,6 +133,21 @@ pub struct ContentEntry {
     pub sha: String,
     pub size: u64,
     pub kind: ContentKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeEntry {
+    pub path: String,
+    pub sha: String,
+    pub kind: String,
+    pub size: Option<u64>,
+}
+
+impl TreeEntry {
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.kind == "blob"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +215,80 @@ impl From<&Repository> for RepoCard {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestSummary {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub head: String,
+    pub base: String,
+    pub draft: bool,
+    pub comments: u64,
+    pub updated_at: DateTime<Utc>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueSummary {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub comments: u64,
+    pub labels: Vec<String>,
+    pub updated_at: DateTime<Utc>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRunSummary {
+    pub id: u64,
+    pub name: String,
+    pub event: String,
+    pub branch: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseSummary {
+    pub id: u64,
+    pub tag_name: String,
+    pub name: Option<String>,
+    pub draft: bool,
+    pub prerelease: bool,
+    pub published_at: Option<DateTime<Utc>>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeSearchResult {
+    pub name: String,
+    pub path: String,
+    pub sha: String,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlameRange {
+    pub starting_line: usize,
+    pub ending_line: usize,
+    pub age: u8,
+    pub commit_sha: String,
+    pub commit_short_sha: String,
+    pub author: String,
+    pub authored_at: DateTime<Utc>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolLocation {
+    pub name: String,
+    pub kind: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub repository: RepoCard,
     pub last_path: Option<String>,
@@ -258,10 +352,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_ssh_url() {
-        let parsed: RepositoryId = "git@github.com:yuna-r/repotrek.git"
-            .parse()
-            .expect("valid SSH URL");
-        assert_eq!(parsed.full_name(), "yuna-r/repotrek");
+    fn rejects_non_github_url() {
+        let error = "https://example.com/owner/repo"
+            .parse::<RepositoryId>()
+            .expect_err("unsupported host");
+        assert_eq!(error, super::RepositoryIdParseError::UnsupportedHost);
     }
 }

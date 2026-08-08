@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
 use chrono::{DateTime, Utc};
 use reqwest::{
@@ -6,21 +6,24 @@ use reqwest::{
     blocking::{Client, RequestBuilder, Response},
     header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     model::{
-        ApiResponse, CommitDetail, CommitFile, CommitStats, CommitSummary, ContentEntry,
-        ContentKind, RateLimit, RepoCard, Repository, RepositoryId,
+        ApiResponse, BlameRange, BranchSummary, CodeSearchResult, CommitDetail, CommitFile,
+        CommitStats, CommitSummary, ContentEntry, ContentKind, IssueSummary, PullRequestSummary,
+        RateLimit, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry,
+        WorkflowRunSummary,
     },
     provider::{ProviderError, ProviderResult, RepositoryProvider},
 };
 
 const API_BASE: &str = "https://api.github.com";
+const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const API_VERSION: &str = "2026-03-10";
 const JSON_ACCEPT: &str = "application/vnd.github+json";
 const RAW_ACCEPT: &str = "application/vnd.github.raw+json";
-const MAX_TEXT_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TEXT_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct GitHubProvider {
@@ -37,14 +40,17 @@ impl GitHubProvider {
                 " (+https://github.com/yuna-r/repotrek)"
             ))
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(40))
             .build()?;
-
         Ok(Self { client, token })
     }
 
     pub fn set_token(&mut self, token: String) {
         self.token = Some(token);
+    }
+
+    pub fn clear_token(&mut self) {
+        self.token = None;
     }
 
     #[must_use]
@@ -56,7 +62,6 @@ impl GitHubProvider {
         let mut request = request
             .header(ACCEPT, accept)
             .header("X-GitHub-Api-Version", API_VERSION);
-
         if let Some(token) = &self.token {
             let value = format!("Bearer {token}");
             if let Ok(mut value) = HeaderValue::from_str(&value) {
@@ -64,13 +69,12 @@ impl GitHubProvider {
                 request = request.header(AUTHORIZATION, value);
             }
         }
-
         request
     }
 
     fn send_json<T>(&self, request: RequestBuilder) -> ProviderResult<T>
     where
-        T: for<'de> Deserialize<'de>,
+        T: DeserializeOwned,
     {
         let response = self.request(request, JSON_ACCEPT).send()?;
         let rate_limit = parse_rate_limit(response.headers());
@@ -86,15 +90,53 @@ impl GitHubProvider {
         let rate_limit = parse_rate_limit(response.headers());
         let response = ensure_success(response, rate_limit.clone())?;
         let bytes = response.bytes()?;
-
         if bytes.len() > MAX_TEXT_FILE_BYTES {
             return Err(ProviderError::FileTooLarge {
                 size: bytes.len(),
                 limit: MAX_TEXT_FILE_BYTES,
             });
         }
-
         let value = String::from_utf8(bytes.to_vec()).map_err(|_| ProviderError::BinaryFile)?;
+        Ok(ApiResponse { value, rate_limit })
+    }
+
+    fn send_graphql<T>(&self, query: &str, variables: serde_json::Value) -> ProviderResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        if self.token.is_none() {
+            return Err(ProviderError::AuthenticationRequired {
+                rate_limit: RateLimit {
+                    resource: Some("graphql".to_owned()),
+                    ..RateLimit::default()
+                },
+            });
+        }
+
+        let body = GraphQlRequest { query, variables };
+        let response = self
+            .request(self.client.post(GRAPHQL_URL).json(&body), JSON_ACCEPT)
+            .send()?;
+        let rate_limit = parse_rate_limit(response.headers());
+        let response = ensure_success(response, rate_limit.clone())?;
+        let envelope = response
+            .json::<GraphQlEnvelope<T>>()
+            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        if let Some(errors) = envelope.errors {
+            let message = errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ProviderError::Api {
+                status: 200,
+                message,
+                rate_limit,
+            });
+        }
+        let value = envelope.data.ok_or_else(|| {
+            ProviderError::InvalidResponse("GraphQL response did not contain data".to_owned())
+        })?;
         Ok(ApiResponse { value, rate_limit })
     }
 
@@ -103,7 +145,7 @@ impl GitHubProvider {
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
         {
             let mut segments = url.path_segments_mut().map_err(|()| {
-                ProviderError::InvalidResponse("GitHub API URLを構築できません".to_owned())
+                ProviderError::InvalidResponse("Could not construct GitHub API URL".to_owned())
             })?;
             segments.extend(["repos", id.owner.as_str(), id.name.as_str()]);
             segments.extend(endpoint.iter().copied());
@@ -137,11 +179,11 @@ impl RepositoryProvider for GitHubProvider {
         let url = self.contents_url(id, path)?;
         let response: ApiResponse<Vec<ContentDto>> =
             self.send_json(self.client.get(url).query(&[("ref", git_ref)]))?;
-        let mut entries: Vec<ContentEntry> = response
+        let mut entries = response
             .value
             .into_iter()
             .map(ContentDto::into_content)
-            .collect();
+            .collect::<Vec<_>>();
         entries.sort_by(|left, right| {
             let left_rank = if left.kind.is_directory() { 0 } else { 1 };
             let right_rank = if right.kind.is_directory() { 0 } else { 1 };
@@ -158,6 +200,38 @@ impl RepositoryProvider for GitHubProvider {
     fn file_content(&self, id: &RepositoryId, path: &str, git_ref: &str) -> ProviderResult<String> {
         let url = self.contents_url(id, path)?;
         self.send_text(self.client.get(url).query(&[("ref", git_ref)]))
+    }
+
+    fn branches(&self, id: &RepositoryId) -> ProviderResult<Vec<BranchSummary>> {
+        let url = self.repo_url(id, &["branches"])?;
+        let response: ApiResponse<Vec<BranchDto>> = self.send_json(
+            self.client
+                .get(url)
+                .query(&[("per_page", "100"), ("page", "1")]),
+        )?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .into_iter()
+                .map(BranchDto::into_summary)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn tree(&self, id: &RepositoryId, git_ref: &str) -> ProviderResult<Vec<TreeEntry>> {
+        let url = self.repo_url(id, &["git", "trees", git_ref])?;
+        let response: ApiResponse<TreeResponseDto> =
+            self.send_json(self.client.get(url).query(&[("recursive", "1")]))?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .tree
+                .into_iter()
+                .map(TreeEntryDto::into_entry)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
     }
 
     fn commits(
@@ -184,11 +258,96 @@ impl RepositoryProvider for GitHubProvider {
         })
     }
 
+    fn file_history(
+        &self,
+        id: &RepositoryId,
+        git_ref: &str,
+        path: &str,
+        page: u32,
+        per_page: u32,
+    ) -> ProviderResult<Vec<CommitSummary>> {
+        let url = self.repo_url(id, &["commits"])?;
+        let response: ApiResponse<Vec<CommitDto>> =
+            self.send_json(self.client.get(url).query(&[
+                ("sha", git_ref.to_owned()),
+                ("path", path.to_owned()),
+                ("page", page.to_string()),
+                ("per_page", per_page.clamp(1, 100).to_string()),
+            ]))?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .into_iter()
+                .map(CommitDto::into_summary)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
     fn commit(&self, id: &RepositoryId, sha: &str) -> ProviderResult<CommitDetail> {
         let url = self.repo_url(id, &["commits", sha])?;
         let response: ApiResponse<CommitDetailDto> = self.send_json(self.client.get(url))?;
         Ok(ApiResponse {
             value: response.value.into_detail(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn blame(
+        &self,
+        id: &RepositoryId,
+        git_ref: &str,
+        path: &str,
+    ) -> ProviderResult<Vec<BlameRange>> {
+        const QUERY: &str = r#"
+query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path: String!) {
+  repository(owner: $owner, name: $name) {
+    object(expression: $expression) {
+      ... on Commit {
+        blame(path: $path) {
+          ranges {
+            startingLine
+            endingLine
+            age
+            commit {
+              oid
+              abbreviatedOid
+              messageHeadline
+              authoredDate
+              author {
+                name
+                user { login }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+        let variables = serde_json::json!({
+            "owner": id.owner.clone(),
+            "name": id.name.clone(),
+            "expression": git_ref,
+            "path": path,
+        });
+        let response: ApiResponse<BlameDataDto> = self.send_graphql(QUERY, variables)?;
+        let ranges = response
+            .value
+            .repository
+            .and_then(|repository| repository.object)
+            .and_then(|object| object.blame)
+            .map(|blame| {
+                blame
+                    .ranges
+                    .into_iter()
+                    .map(BlameRangeDto::into_range)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(ApiResponse {
+            value: ranges,
             rate_limit: response.rate_limit,
         })
     }
@@ -201,7 +360,7 @@ impl RepositoryProvider for GitHubProvider {
     ) -> ProviderResult<Vec<RepoCard>> {
         let url = Url::parse("https://api.github.com/search/repositories")
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
-        let response: ApiResponse<SearchResponseDto> =
+        let response: ApiResponse<SearchRepositoryResponseDto> =
             self.send_json(self.client.get(url).query(&[
                 ("q", query.to_owned()),
                 ("sort", sort.to_owned()),
@@ -215,6 +374,118 @@ impl RepositoryProvider for GitHubProvider {
                 .into_iter()
                 .map(SearchRepositoryDto::into_card)
                 .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn search_code(
+        &self,
+        id: &RepositoryId,
+        query: &str,
+        per_page: u32,
+    ) -> ProviderResult<Vec<CodeSearchResult>> {
+        let url = Url::parse("https://api.github.com/search/code")
+            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        let q = format!("{query} repo:{}", id.full_name());
+        let response: ApiResponse<SearchCodeResponseDto> =
+            self.send_json(self.client.get(url).query(&[
+                ("q", q),
+                ("per_page", per_page.clamp(1, 100).to_string()),
+                ("page", "1".to_owned()),
+            ]))?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .items
+                .into_iter()
+                .map(SearchCodeItemDto::into_result)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn pull_requests(&self, id: &RepositoryId) -> ProviderResult<Vec<PullRequestSummary>> {
+        let url = self.repo_url(id, &["pulls"])?;
+        let response: ApiResponse<Vec<PullRequestDto>> =
+            self.send_json(self.client.get(url).query(&[
+                ("state", "open"),
+                ("sort", "updated"),
+                ("per_page", "50"),
+            ]))?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .into_iter()
+                .map(PullRequestDto::into_summary)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn issues(&self, id: &RepositoryId) -> ProviderResult<Vec<IssueSummary>> {
+        let url = self.repo_url(id, &["issues"])?;
+        let response: ApiResponse<Vec<IssueDto>> =
+            self.send_json(self.client.get(url).query(&[
+                ("state", "open"),
+                ("sort", "updated"),
+                ("per_page", "50"),
+            ]))?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .into_iter()
+                .filter(|issue| issue.pull_request.is_none())
+                .map(IssueDto::into_summary)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn workflow_runs(
+        &self,
+        id: &RepositoryId,
+        git_ref: &str,
+    ) -> ProviderResult<Vec<WorkflowRunSummary>> {
+        let url = self.repo_url(id, &["actions", "runs"])?;
+        let response: ApiResponse<WorkflowRunsResponseDto> = self.send_json(
+            self.client
+                .get(url)
+                .query(&[("branch", git_ref), ("per_page", "50")]),
+        )?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .workflow_runs
+                .into_iter()
+                .map(WorkflowRunDto::into_summary)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn releases(&self, id: &RepositoryId) -> ProviderResult<Vec<ReleaseSummary>> {
+        let url = self.repo_url(id, &["releases"])?;
+        let response: ApiResponse<Vec<ReleaseDto>> = self.send_json(
+            self.client
+                .get(url)
+                .query(&[("per_page", "50"), ("page", "1")]),
+        )?;
+        Ok(ApiResponse {
+            value: response
+                .value
+                .into_iter()
+                .map(ReleaseDto::into_summary)
+                .collect(),
+            rate_limit: response.rate_limit,
+        })
+    }
+
+    fn viewer_login(&self) -> ProviderResult<String> {
+        let url = Url::parse("https://api.github.com/user")
+            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        let response: ApiResponse<ViewerDto> = self.send_json(self.client.get(url))?;
+        Ok(ApiResponse {
+            value: response.value.login,
             rate_limit: response.rate_limit,
         })
     }
@@ -244,6 +515,12 @@ fn ensure_success(response: Response, rate_limit: RateLimit) -> Result<Response,
                 body
             }
         });
+
+    if status == StatusCode::UNAUTHORIZED
+        || (status == StatusCode::FORBIDDEN && message.to_ascii_lowercase().contains("auth"))
+    {
+        return Err(ProviderError::AuthenticationRequired { rate_limit });
+    }
 
     if matches!(
         status,
@@ -278,14 +555,12 @@ fn parse_rate_limit(headers: &HeaderMap) -> RateLimit {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok())
     }
-
     fn parse_i64(headers: &HeaderMap, name: &'static str) -> Option<i64> {
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok())
     }
-
     RateLimit {
         limit: parse_u32(headers, "x-ratelimit-limit"),
         remaining: parse_u32(headers, "x-ratelimit-remaining"),
@@ -337,7 +612,7 @@ impl RepositoryDto {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct OwnerDto {
     login: String,
 }
@@ -367,6 +642,55 @@ impl ContentDto {
             sha: self.sha,
             size: self.size,
             kind,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchDto {
+    name: String,
+    commit: BranchCommitDto,
+    protected: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchCommitDto {
+    sha: String,
+}
+
+impl BranchDto {
+    fn into_summary(self) -> BranchSummary {
+        BranchSummary {
+            name: self.name,
+            sha: self.commit.sha,
+            protected: self.protected,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeResponseDto {
+    tree: Vec<TreeEntryDto>,
+    #[allow(dead_code)]
+    truncated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeEntryDto {
+    path: String,
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
+    size: Option<u64>,
+}
+
+impl TreeEntryDto {
+    fn into_entry(self) -> TreeEntry {
+        TreeEntry {
+            path: self.path,
+            sha: self.sha,
+            kind: self.kind,
+            size: self.size,
         }
     }
 }
@@ -482,7 +806,6 @@ fn into_commit_summary(
     let verified = commit
         .verification
         .is_some_and(|verification| verification.verified);
-
     CommitSummary {
         sha,
         title,
@@ -526,7 +849,7 @@ impl CommitFileDto {
 }
 
 #[derive(Debug, Deserialize)]
-struct SearchResponseDto {
+struct SearchRepositoryResponseDto {
     items: Vec<SearchRepositoryDto>,
 }
 
@@ -541,7 +864,7 @@ struct SearchRepositoryDto {
 
 impl SearchRepositoryDto {
     fn into_card(self) -> RepoCard {
-        let id = self.full_name.parse().unwrap_or_else(|_| RepositoryId {
+        let id = RepositoryId::from_str(&self.full_name).unwrap_or_else(|_| RepositoryId {
             owner: "unknown".to_owned(),
             name: self.full_name.replace('/', "-"),
         });
@@ -553,6 +876,242 @@ impl SearchRepositoryDto {
             updated_at: self.updated_at,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchCodeResponseDto {
+    items: Vec<SearchCodeItemDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchCodeItemDto {
+    name: String,
+    path: String,
+    sha: String,
+    html_url: String,
+}
+
+impl SearchCodeItemDto {
+    fn into_result(self) -> CodeSearchResult {
+        CodeSearchResult {
+            name: self.name,
+            path: self.path,
+            sha: self.sha,
+            html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRequestDto {
+    number: u64,
+    title: String,
+    user: OwnerDto,
+    head: PullRefDto,
+    base: PullRefDto,
+    draft: Option<bool>,
+    comments: Option<u64>,
+    updated_at: DateTime<Utc>,
+    html_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullRefDto {
+    #[serde(rename = "ref")]
+    git_ref: String,
+}
+
+impl PullRequestDto {
+    fn into_summary(self) -> PullRequestSummary {
+        PullRequestSummary {
+            number: self.number,
+            title: self.title,
+            author: self.user.login,
+            head: self.head.git_ref,
+            base: self.base.git_ref,
+            draft: self.draft.unwrap_or(false),
+            comments: self.comments.unwrap_or(0),
+            updated_at: self.updated_at,
+            html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueDto {
+    number: u64,
+    title: String,
+    user: OwnerDto,
+    comments: u64,
+    labels: Vec<LabelDto>,
+    updated_at: DateTime<Utc>,
+    html_url: String,
+    pull_request: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LabelDto {
+    name: String,
+}
+
+impl IssueDto {
+    fn into_summary(self) -> IssueSummary {
+        IssueSummary {
+            number: self.number,
+            title: self.title,
+            author: self.user.login,
+            comments: self.comments,
+            labels: self.labels.into_iter().map(|label| label.name).collect(),
+            updated_at: self.updated_at,
+            html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunsResponseDto {
+    workflow_runs: Vec<WorkflowRunDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunDto {
+    id: u64,
+    name: Option<String>,
+    event: String,
+    head_branch: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    created_at: DateTime<Utc>,
+    html_url: String,
+}
+
+impl WorkflowRunDto {
+    fn into_summary(self) -> WorkflowRunSummary {
+        WorkflowRunSummary {
+            id: self.id,
+            name: self.name.unwrap_or_else(|| "Workflow".to_owned()),
+            event: self.event,
+            branch: self.head_branch.unwrap_or_default(),
+            status: self.status.unwrap_or_else(|| "unknown".to_owned()),
+            conclusion: self.conclusion,
+            created_at: self.created_at,
+            html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseDto {
+    id: u64,
+    tag_name: String,
+    name: Option<String>,
+    draft: bool,
+    prerelease: bool,
+    published_at: Option<DateTime<Utc>>,
+    html_url: String,
+}
+
+impl ReleaseDto {
+    fn into_summary(self) -> ReleaseSummary {
+        ReleaseSummary {
+            id: self.id,
+            tag_name: self.tag_name,
+            name: self.name,
+            draft: self.draft,
+            prerelease: self.prerelease,
+            published_at: self.published_at,
+            html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ViewerDto {
+    login: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphQlRequest<'a> {
+    query: &'a str,
+    variables: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlEnvelope<T> {
+    data: Option<T>,
+    errors: Option<Vec<GraphQlErrorDto>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlErrorDto {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlameDataDto {
+    repository: Option<BlameRepositoryDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlameRepositoryDto {
+    object: Option<BlameObjectDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlameObjectDto {
+    blame: Option<BlameDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlameDto {
+    ranges: Vec<BlameRangeDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlameRangeDto {
+    starting_line: usize,
+    ending_line: usize,
+    age: u8,
+    commit: BlameCommitDto,
+}
+
+impl BlameRangeDto {
+    fn into_range(self) -> BlameRange {
+        let author = self
+            .commit
+            .author
+            .as_ref()
+            .and_then(|actor| actor.user.as_ref().map(|user| user.login.clone()))
+            .or_else(|| self.commit.author.map(|actor| actor.name))
+            .unwrap_or_else(|| "Unknown".to_owned());
+        BlameRange {
+            starting_line: self.starting_line,
+            ending_line: self.ending_line,
+            age: self.age,
+            commit_sha: self.commit.oid,
+            commit_short_sha: self.commit.abbreviated_oid,
+            author,
+            authored_at: self.commit.authored_date,
+            message: self.commit.message_headline,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlameCommitDto {
+    oid: String,
+    abbreviated_oid: String,
+    message_headline: String,
+    authored_date: DateTime<Utc>,
+    author: Option<BlameActorDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlameActorDto {
+    name: String,
+    user: Option<OwnerDto>,
 }
 
 #[cfg(test)]
