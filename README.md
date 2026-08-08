@@ -88,10 +88,11 @@ Repository
 
 Readers
   Up/Down            move by line
-  Ctrl+Up/Down       extend line selection
-  Ctrl+A             select all
-  Ctrl+C             copy selection
-  v, y               Vim-style select/copy alternatives
+  Shift+J/K          extend line selection
+  Shift+A            select all
+  Shift+C            copy selection
+  Esc                 clear selection before leaving
+  v, y                Vim-style select/copy alternatives
   w                  toggle wrapping
   Tab                Code / Blame / History in a source file
   @                  symbols in the current file

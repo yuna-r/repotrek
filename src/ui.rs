@@ -139,10 +139,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, theme: Theme) {
             "←/→ tabs  ↑↓ select  Enter view  o GitHub  Esc/u parent  B branch  f files  s search"
         }
         Screen::File => {
-            "Tab Code/Blame/History  ↑↓ move  Ctrl+↑↓ select  Ctrl+A all  Ctrl+C copy  w wrap  Esc parent"
+            "Tab Code/Blame/History  ↑↓ move  Shift+J/K select  Shift+A all  Shift+C copy  w wrap  Esc parent"
         }
         Screen::Commit | Screen::Detail => {
-            "↑↓ scroll  Ctrl+↑↓ select  Ctrl+A all  Ctrl+C copy  w wrap  o GitHub  Esc back"
+            "↑↓ scroll  Shift+J/K select  Shift+A all  Shift+C copy  w wrap  o GitHub  Esc back"
         }
     };
     let text = app.status_text().unwrap_or(hint);
@@ -1339,14 +1339,14 @@ fn reader_line(
     };
 
     if line.starts_with("@@") {
-        return Line::styled(
-            line.to_owned(),
-            Style::new().fg(theme.accent).bg(if selected {
-                theme.selection
-            } else {
-                theme.diff_hunk_bg
-            }),
-        );
+        let bg = if selected {
+            theme.selection
+        } else if line_index == cursor_line {
+            theme.cursor
+        } else {
+            theme.diff_hunk_bg
+        };
+        return Line::styled(line.to_owned(), Style::new().fg(theme.accent).bg(bg));
     }
     if line.starts_with("--- ") {
         return Line::styled(
@@ -1360,6 +1360,8 @@ fn reader_line(
     if let Some((prefix, sign, source)) = split_numbered_diff(line) {
         let diff_bg = if selected {
             theme.selection
+        } else if line_index == cursor_line {
+            theme.cursor
         } else {
             match sign {
                 '+' => theme.diff_add_bg,
@@ -1813,9 +1815,10 @@ fn help_lines(app: &App, theme: Theme) -> Vec<Line<'static>> {
             Style::new().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         Line::raw("  ↑↓                Move source/detail cursor"),
-        Line::raw("  Ctrl+↑ / Ctrl+↓   Extend line selection"),
-        Line::raw("  Ctrl+A            Select all lines"),
-        Line::raw("  Ctrl+C            Copy selection to system clipboard"),
+        Line::raw("  Shift+J / Shift+K Extend line selection"),
+        Line::raw("  Shift+A           Select all lines"),
+        Line::raw("  Shift+C           Copy selection to system clipboard"),
+        Line::raw("  Esc               Clear selection before leaving"),
         Line::raw("  v / y             Vim-style selection / copy remains available"),
         Line::raw("  w                 Toggle right wrapping for source or diff/detail"),
         Line::raw("  @                 Jump to function/type/symbol in current file"),

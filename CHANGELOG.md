@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.5
+
+- Made `Shift+A` the official select-all shortcut for readers.
+- Made `Shift+C` the official copy-selection shortcut for readers.
+- `Esc` now clears an active selection before navigating away.
+- Kept `Ctrl+A` / `Ctrl+C` as compatibility shortcuts where terminals deliver them.
+
+## 0.3.4
+
+- Made `Shift+J` / `Shift+K` the official line-range selection shortcuts.
+- Removed documented reliance on `Shift+Up` / `Shift+Down`, which is intercepted or normalized by some macOS terminal environments.
+- Kept the improved Dark and Light current-line highlighting from v0.3.3.
+
+## 0.3.3
+
+- Changed line-range selection from `Ctrl+Up` / `Ctrl+Down` to `Shift+Up` / `Shift+Down` to avoid macOS and terminal shortcut conflicts.
+- Updated in-app keyboard help and README documentation for the new selection shortcut.
+
 ## 0.3.2
 
 - Add per-entry browsing history deletion from the Home screen.

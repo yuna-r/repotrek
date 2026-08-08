@@ -901,6 +901,63 @@ impl App {
             self.modal = Some(Modal::Help);
             return AppCommand::None;
         }
+
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('A') | KeyCode::Char('a'))
+        {
+            match self.screen {
+                Screen::File => {
+                    if let Some(file) = self.file.as_mut()
+                        && file.tab != FileTab::History
+                    {
+                        let last = file.line_count().saturating_sub(1);
+                        file.selection_anchor = Some(0);
+                        file.cursor_line = last;
+                        keep_cursor_visible(file);
+                    }
+                }
+                Screen::Commit => {
+                    if let Some(commit) = self.commit.as_mut() {
+                        let last = commit.line_count().saturating_sub(1);
+                        commit.selection_anchor = Some(0);
+                        commit.cursor_line = last;
+                        keep_reader_cursor_visible(commit.cursor_line, &mut commit.viewport_top);
+                    }
+                }
+                Screen::Detail => {
+                    if let Some(detail) = self.detail.as_mut() {
+                        let last = detail.line_count().saturating_sub(1);
+                        detail.selection_anchor = Some(0);
+                        detail.cursor_line = last;
+                        keep_reader_cursor_visible(detail.cursor_line, &mut detail.viewport_top);
+                    }
+                }
+                Screen::Home | Screen::Repository => {}
+            }
+            return AppCommand::None;
+        }
+
+        if key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('C') | KeyCode::Char('c'))
+        {
+            return match self.screen {
+                Screen::File => self.file.as_ref().map_or(AppCommand::None, |file| {
+                    if file.tab == FileTab::History {
+                        AppCommand::None
+                    } else {
+                        AppCommand::CopyText(file.selected_text())
+                    }
+                }),
+                Screen::Commit => self.commit.as_ref().map_or(AppCommand::None, |commit| {
+                    AppCommand::CopyText(commit.selected_text())
+                }),
+                Screen::Detail => self.detail.as_ref().map_or(AppCommand::None, |detail| {
+                    AppCommand::CopyText(detail.selected_text())
+                }),
+                Screen::Home | Screen::Repository => AppCommand::None,
+            };
+        }
+
         if key.code == KeyCode::Char('a')
             && !(self.screen == Screen::Home && self.home.focus == HomeFocus::Search)
         {
@@ -925,7 +982,9 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             match self.screen {
                 Screen::File => {
-                    if let Some(file) = self.file.as_mut() {
+                    if let Some(file) = self.file.as_mut()
+                        && file.tab != FileTab::History
+                    {
                         let last = file.line_count().saturating_sub(1);
                         file.selection_anchor = Some(0);
                         file.cursor_line = last;
@@ -1776,23 +1835,27 @@ impl App {
             return AppCommand::None;
         };
 
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
-            && file.tab != FileTab::History
-        {
-            if file.selection_anchor.is_none() {
-                file.selection_anchor = Some(file.cursor_line);
+        if file.tab != FileTab::History {
+            if let Some(delta) = selection_delta(key) {
+                if file.selection_anchor.is_none() {
+                    file.selection_anchor = Some(file.cursor_line);
+                }
+                if delta < 0 {
+                    file.cursor_line = file.cursor_line.saturating_sub(1);
+                } else {
+                    file.cursor_line =
+                        (file.cursor_line + 1).min(file.line_count().saturating_sub(1));
+                }
+                keep_cursor_visible(file);
+                return AppCommand::None;
             }
-            if key.code == KeyCode::Up {
-                file.cursor_line = file.cursor_line.saturating_sub(1);
-            } else {
-                file.cursor_line = (file.cursor_line + 1).min(file.line_count().saturating_sub(1));
-            }
-            keep_cursor_visible(file);
-            return AppCommand::None;
         }
 
         match key.code {
+            KeyCode::Esc if file.selection_anchor.is_some() && file.tab != FileTab::History => {
+                file.selection_anchor = None;
+                AppCommand::None
+            }
             KeyCode::Esc => {
                 let parent = file
                     .path
@@ -1963,13 +2026,10 @@ impl App {
         };
         let line_count = commit.line_count();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        {
+        if let Some(delta) = selection_delta(key) {
             if commit.selection_anchor.is_none() {
                 commit.selection_anchor = Some(commit.cursor_line);
             }
-            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
             move_reader_cursor(
                 &mut commit.cursor_line,
                 &mut commit.viewport_top,
@@ -1980,6 +2040,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Esc if commit.selection_anchor.is_some() => {
+                commit.selection_anchor = None;
+                AppCommand::None
+            }
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('b') => {
                 self.screen = Screen::Repository;
                 AppCommand::None
@@ -2063,13 +2127,10 @@ impl App {
         };
         let line_count = detail.line_count();
 
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        {
+        if let Some(delta) = selection_delta(key) {
             if detail.selection_anchor.is_none() {
                 detail.selection_anchor = Some(detail.cursor_line);
             }
-            let delta = if key.code == KeyCode::Up { -1 } else { 1 };
             move_reader_cursor(
                 &mut detail.cursor_line,
                 &mut detail.viewport_top,
@@ -2080,6 +2141,10 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Esc if detail.selection_anchor.is_some() => {
+                detail.selection_anchor = None;
+                AppCommand::None
+            }
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('b') => {
                 self.screen = Screen::Repository;
                 AppCommand::None
@@ -2222,6 +2287,18 @@ impl App {
                     resume_screen: HistoryScreen::Code,
                 }),
         }
+    }
+}
+
+fn selection_delta(key: KeyEvent) -> Option<isize> {
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('K') => Some(-1),
+        KeyCode::Char('J') => Some(1),
+        _ => None,
     }
 }
 

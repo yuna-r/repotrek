@@ -76,9 +76,10 @@ Repository
 
 Reader
   上下               1行移動
-  Ctrl+上下          行範囲選択
-  Ctrl+A             全選択
-  Ctrl+C             コピー
+  Shift+J/K          行範囲選択
+  Shift+A            全選択
+  Shift+C            コピー
+  Esc                 選択解除（未選択時は戻る）
   v / y              Vim風の選択／コピー
   w                  折返し切替
   Tab                Code / Blame / History

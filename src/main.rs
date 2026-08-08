@@ -14,12 +14,19 @@ mod symbols;
 mod theme;
 mod ui;
 
-use std::{process::Command, str::FromStr, time::Duration};
+use std::{io::stdout, process::Command, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
-use crossterm::event::{self, Event};
+use crossterm::{
+    event::{
+        self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
+    execute,
+    terminal::supports_keyboard_enhancement,
+};
 use ratatui::DefaultTerminal;
 
 use crate::{
@@ -56,6 +63,7 @@ fn main() -> Result<()> {
     );
 
     let mut terminal = ratatui::try_init().context("Could not initialize terminal")?;
+    let keyboard_enhancement = enable_keyboard_enhancement();
     let result = run(
         &mut terminal,
         &mut app,
@@ -64,6 +72,9 @@ fn main() -> Result<()> {
         cli.repository,
         cli.no_home_refresh,
     );
+    if keyboard_enhancement {
+        disable_keyboard_enhancement();
+    }
     let restore_result = ratatui::try_restore().context("Could not restore terminal");
 
     match (result, restore_result) {
@@ -71,6 +82,24 @@ fn main() -> Result<()> {
         (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn enable_keyboard_enhancement() -> bool {
+    if !matches!(supports_keyboard_enhancement(), Ok(true)) {
+        return false;
+    }
+
+    let mut output = stdout();
+    execute!(
+        output,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
+}
+
+fn disable_keyboard_enhancement() {
+    let mut output = stdout();
+    let _ = execute!(output, PopKeyboardEnhancementFlags);
 }
 
 fn run(
