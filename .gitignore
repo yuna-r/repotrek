@@ -4,3 +4,7 @@
 *.swp
 *.swo
 repotrek-*.html
+
+# Local patch files
+*.patch
+*.diff
