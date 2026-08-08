@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,108 +12,138 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: linux-x86_64
-            os: ubuntu-24.04
+          - name: Linux x86_64
+            id: linux-x86_64
+            os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             binary: repotrek
             archive: repotrek-linux-x86_64.tar.gz
+            windows: false
 
-          - name: linux-aarch64
-            os: ubuntu-24.04-arm
+          - name: Linux ARM64
+            id: linux-aarch64
+            os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             binary: repotrek
             archive: repotrek-linux-aarch64.tar.gz
+            windows: false
 
-          - name: macos-aarch64
+          - name: macOS Apple Silicon
+            id: macos-aarch64
             os: macos-15
             target: aarch64-apple-darwin
             binary: repotrek
             archive: repotrek-macos-aarch64.tar.gz
+            windows: false
 
-          - name: macos-x86_64
+          - name: macOS Intel
+            id: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
             binary: repotrek
             archive: repotrek-macos-x86_64.tar.gz
+            windows: false
 
-          - name: windows-x86_64
+          - name: Windows x86_64
+            id: windows-x86_64
             os: windows-2025
             target: x86_64-pc-windows-msvc
             binary: repotrek.exe
             archive: repotrek-windows-x86_64.zip
+            windows: true
 
-          - name: windows-aarch64
+          - name: Windows ARM64
+            id: windows-aarch64
             os: windows-11-arm
             target: aarch64-pc-windows-msvc
             binary: repotrek.exe
             archive: repotrek-windows-aarch64.zip
+            windows: true
+
+    env:
+      CARGO_TERM_COLOR: always
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out tag
+        uses: actions/checkout@v6
 
-      - name: Install Rust target
-        run: rustup target add ${{ matrix.target }}
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package Unix
-        if: runner.os != 'Windows'
+      - name: Install pinned Rust toolchain and target
         shell: bash
         run: |
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/repotrek" dist/
-          cp README.md README.ja.md LICENSE dist/
+          rustup show
+          rustup target add "${{ matrix.target }}"
 
-          tar -C dist -czf "${{ matrix.archive }}" .
+      - name: Test
+        run: cargo test --all-features --target ${{ matrix.target }}
 
-      - name: Package Windows
-        if: runner.os == 'Windows'
+      - name: Build release binary
+        run: cargo build --release --all-features --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: ${{ !matrix.windows }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf package
+          mkdir -p package
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" package/repotrek
+          chmod +x package/repotrek
+          cp README.md README.ja.md CHANGELOG.md LICENSE package/
+          tar -C package -czf "${{ matrix.archive }}" .
+
+      - name: Package Windows archive
+        if: ${{ matrix.windows }}
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/repotrek.exe" dist/
-          Copy-Item README.md dist/
-          Copy-Item README.ja.md dist/
-          Copy-Item LICENSE dist/
+          $ErrorActionPreference = "Stop"
+          Remove-Item package -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "package/repotrek.exe"
+          Copy-Item README.md, README.ja.md, CHANGELOG.md, LICENSE package/
+          Compress-Archive -Path package/* -DestinationPath "${{ matrix.archive }}" -Force
 
-          Compress-Archive `
-            -Path dist/* `
-            -DestinationPath "${{ matrix.archive }}"
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.name }}
+          name: release-${{ matrix.id }}
           path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
 
   release:
-    name: Create GitHub Release
+    name: Attach assets to GitHub Release
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all packaged binaries
+        uses: actions/download-artifact@v8
         with:
+          pattern: release-*
           path: release-assets
           merge-multiple: true
 
       - name: Generate SHA256SUMS
         shell: bash
         working-directory: release-assets
-        run: sha256sum repotrek-* > SHA256SUMS
+        run: |
+          set -euo pipefail
+          sha256sum repotrek-* > SHA256SUMS
+          cat SHA256SUMS
 
-      - name: Create GitHub Release
+      - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
+          set -euo pipefail
           gh release create "${{ github.ref_name }}" \
             release-assets/* \
             --repo "${{ github.repository }}" \
+            --verify-tag \
             --title "RepoTrek ${{ github.ref_name }}" \
             --generate-notes

@@ -1,8 +1,11 @@
 # RepoTrek
 
-**A terminal-first GitHub source browser for reading code deeply without cloning a repository.**
+**A terminal-first GitHub source browser for reading repositories deeply without cloning them.**
 
 [日本語](README.ja.md)
+
+> [!IMPORTANT]
+> RepoTrek can start anonymously, but GitHub API authentication is strongly recommended. Anonymous access is heavily rate-limited, and features such as Blame require authentication. Press `F2` anywhere, or `a` outside a text field, to sign in. GitHub CLI and persistent token credentials are reused on later launches.
 
 ## Run
 
@@ -19,34 +22,88 @@
    .\repotrek.exe
    ```
 
-Open a repository directly with `repotrek owner/repo`.
+Enter exactly `owner/repo` to open a repository directly. Every other value uses GitHub repository search with best-match results and RepoTrek relevance reranking.
 
 <details>
-<summary><strong>Features and keys</strong></summary>
+<summary><strong>Authentication</strong></summary>
 
-RepoTrek brings GitHub-style repository browsing into a keyboard-driven TUI.
+Press `F2` anywhere, or `a` outside a text field, to choose one of these methods:
 
-- Repository search from Home
-- Code / Commits / Pull requests / Issues / Actions / Releases
-- Branch switching
-- Recursive file finder
-- Repository-wide source search
-- Line numbers and syntax highlighting
-- Line-range selection and system clipboard copy
-- Blame and file History
-- Function/type/symbol jump
-- Repository-wide definition/symbol search
-- Commit diffs with old/new line numbers
-- Print-friendly HTML export
-- GitHub API token entry from the TUI
-- GitHub CLI/browser authentication
+1. GitHub CLI / browser sign-in, persisted by GitHub CLI
+2. Personal Access Token for the current process only
+3. Personal Access Token persisted through GitHub CLI or the operating-system credential store
+
+RepoTrek checks credentials in this order:
 
 ```text
-Home        Enter open/search       Ctrl+A auth
-Repository  ←/→ tabs   u up   B branch   f files   s search
-Source      Tab Code/Blame/History   v select   y copy
-            @ symbols   d definition   p print
-Global      ? help   q quit
+REPOTREK_GITHUB_TOKEN
+GH_TOKEN
+GITHUB_TOKEN
+GitHub CLI credentials
+OS credential store fallback
+anonymous access
+```
+
+Tokens are never written to RepoTrek's history or settings JSON files. Use `--anonymous` to ignore stored and environment credentials for one run.
+
+</details>
+
+<details>
+<summary><strong>Main features</strong></summary>
+
+- GitHub-style Code, Commits, Pull requests, Issues, Actions, and Releases tabs
+- Pull request conversation/diff, issue comments, workflow jobs/steps, and release assets inside the TUI
+- Explicit `o` key for links that open GitHub in a browser
+- Branch switching and recursive file finder
+- Repository search and repository-wide code search
+- Blame, file history, commit details, and old/new diff line numbers
+- Function/type/symbol list and definition search
+- Language-aware syntax colors for Rust, C/C++, C#, Java, Kotlin, Swift, Go, Python, Ruby, Shell, JavaScript/TypeScript, JSON, YAML, TOML, SQL, HTML/XML, CSS, Markdown, Lua, Haskell, and fallback text
+- Dark theme by default and a white-background Light theme
+- Persistent source/diff wrapping settings
+- Keyboard line selection and system clipboard integration
+- Print-oriented HTML export with line numbers, syntax colors, and readable A4 landscape CSS
+
+</details>
+
+<details>
+<summary><strong>Keys</strong></summary>
+
+```text
+Home
+  Enter             open exact owner/repo or search
+  Up/Down, Tab      move through sections consistently
+  F5, Ctrl+R        refresh
+  Esc               clear input; quit when input is empty
+
+Repository
+  Left/Right, h/l   switch tabs
+  1..6              Code / Commits / PR / Issues / Actions / Releases
+  Enter             open the selected item inside RepoTrek
+  o                 open the selected GitHub link in a browser
+  Esc, u, ..        parent directory
+  B                 switch branch
+  f                 recursive file finder
+  s, /              repository-wide source search
+
+Readers
+  Up/Down            move by line
+  Ctrl+Up/Down       extend line selection
+  Ctrl+A             select all
+  Ctrl+C             copy selection
+  v, y               Vim-style select/copy alternatives
+  w                  toggle wrapping
+  Tab                Code / Blame / History in a source file
+  @                  symbols in the current file
+  d                  definition/symbol search
+  p                  export print-ready HTML
+
+Global
+  F2 / a             GitHub authentication
+  ,                  settings
+  T                  Dark / Light theme
+  ?                  help
+  q, Ctrl+Q          quit
 ```
 
 </details>
@@ -54,19 +111,12 @@ Global      ? help   q quit
 <details>
 <summary><strong>Build from source</strong></summary>
 
-Requires Rust 1.97+. GitHub CLI (`gh`) is optional.
+Rust 1.97 or later is required.
 
 ```bash
 git clone https://github.com/yuna-r/repotrek.git
 cd repotrek
 cargo build --release
-```
-
-Binaries:
-
-```text
-target/release/repotrek       Linux / macOS
-target/release/repotrek.exe   Windows
 ```
 
 Development verification:
@@ -75,69 +125,24 @@ Development verification:
 ./scripts/verify.sh
 ```
 
-On Windows:
-
-```powershell
-cargo fmt --all
-cargo clippy --all-targets --all-features
-cargo test --all-targets --all-features
-cargo build --release
-```
-
-Linux clipboard integration uses `wl-copy`/`wl-paste`, `xclip`, or `xsel`.
+Linux clipboard integration uses `wl-copy`/`wl-paste`, `xclip`, or `xsel` when available.
 
 </details>
 
 <details>
-<summary><strong>GitHub authentication</strong></summary>
+<summary><strong>Release binaries</strong></summary>
 
-Public repository browsing starts anonymously. GitHub currently limits unauthenticated REST requests to 60 per hour per originating IP, while normal authenticated user requests have a much larger primary quota. RepoTrek asks for authentication only when needed, or you can press `Ctrl+A`.
-
-Authentication options:
-
-1. GitHub CLI / browser
-2. Personal Access Token for this session
-3. Personal Access Token stored in macOS Keychain
-
-Token entry is masked and supports `Ctrl+V`. Session PATs stay only in process memory. RepoTrek does not write PATs to its history database.
-
-Environment token lookup order:
+Pushing a signed `v*` tag runs the release workflow and attaches these archives to GitHub Releases:
 
 ```text
-REPOTREK_GITHUB_TOKEN
-GH_TOKEN
-GITHUB_TOKEN
+repotrek-linux-x86_64.tar.gz
+repotrek-linux-aarch64.tar.gz
+repotrek-macos-aarch64.tar.gz
+repotrek-macos-x86_64.tar.gz
+repotrek-windows-x86_64.zip
+repotrek-windows-aarch64.zip
+SHA256SUMS
 ```
-
-Use `--anonymous` to ignore environment and Keychain tokens for that run. Blame uses GitHub GraphQL and therefore requires authentication.
-
-</details>
-
-<details>
-<summary><strong>Printing</strong></summary>
-
-Press `p` on a source file or commit. RepoTrek exports white-background HTML designed for reading and printing, including syntax colors, source line numbers, diff old/new line numbers, explicit `+`/`-` markers, and A4 landscape print CSS.
-
-The temporary `Exported ...` status disappears automatically after a few seconds.
-
-</details>
-
-<details>
-<summary><strong>Architecture</strong></summary>
-
-```text
-GitHub REST / GraphQL
-        |
-RepositoryProvider
-        |
-semantic models
-        |
-+----------------------------+
-| TUI | search | print/export |
-+----------------------------+
-```
-
-GitHub is the first provider. The provider boundary is separate so GitLab, Forgejo, Gitea, and generic Git backends can be added later.
 
 </details>
 

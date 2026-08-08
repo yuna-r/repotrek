@@ -24,7 +24,6 @@ pub fn export_file(
         sanitize_filename(path)
     );
     let output = std::env::current_dir()?.join(filename);
-    let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     let rows = content
         .lines()
         .enumerate()
@@ -32,7 +31,7 @@ pub fn export_file(
             format!(
                 "<tr><td class=\"ln\">{}</td><td class=\"code\"><code>{}</code></td></tr>",
                 index + 1,
-                source_html(line, extension)
+                source_html(line, path)
             )
         })
         .collect::<Vec<_>>()
@@ -77,10 +76,6 @@ pub fn export_commit(repository: &Repository, detail: &CommitDetail) -> Result<P
     let mut files_html = String::new();
 
     for file in &detail.files {
-        let extension = file
-            .filename
-            .rsplit_once('.')
-            .map_or("", |(_, extension)| extension);
         let diff_html = file.patch.as_deref().map_or_else(
             || "<p class=\"muted\">Diff omitted by GitHub API for this file.</p>".to_owned(),
             |patch| {
@@ -106,7 +101,7 @@ pub fn export_commit(repository: &Repository, detail: &CommitDetail) -> Result<P
                             };
                             format!(
                                 "<tr class=\"{class}\"><td class=\"ln old\">{old}</td><td class=\"ln new\">{new}</td><td class=\"sign\">{sign}</td><td class=\"code\"><code>{code}</code></td></tr>",
-                                code = source_html(&line.text, extension)
+                                code = source_html(&line.text, &file.filename)
                             )
                         }
                     })
@@ -201,11 +196,11 @@ fn write_document(path: &Path, title: &str, body: &str) -> Result<()> {
 html {{ background: #f6f8fa; }}
 body {{
   margin: 0 auto;
-  max-width: 1280px;
-  padding: 28px 34px 60px;
+  max-width: 1440px;
+  padding: 36px 42px 72px;
   color: #1f2328;
   background: #fff;
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 15px/1.58 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }}
 .doc-header {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-start; padding-bottom:18px; border-bottom:1px solid #d0d7de; margin-bottom:18px; }}
 .repo {{ font-size:20px; font-weight:700; color:#0969da; }}
@@ -227,22 +222,22 @@ dl {{ display:grid; grid-template-columns:90px 1fr; gap:5px 12px; margin:0; }} d
 .diff-table .ln {{ width:52px; min-width:52px; }}
 .sign {{ width:28px; min-width:28px; text-align:center !important; color:#6e7781; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
 .code {{ padding:0 12px !important; }}
-.code code, .hunk code, .meta-line code {{ white-space:pre; tab-size:4; font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+.code code, .hunk code, .meta-line code {{ white-space:pre; tab-size:4; font:13px/1.68 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }}
 .hunk td {{ padding:4px 10px !important; color:#0550ae; background:#ddf4ff; border-top:1px solid #b6e3ff; border-bottom:1px solid #b6e3ff; }}
 .meta-line td {{ padding:3px 10px !important; color:#6e7781; }}
 .add td {{ background:#e6ffec; }} .del td {{ background:#ffebe9; }}
 .plus {{ color:#1a7f37; font-weight:650; }} .minus {{ color:#cf222e; font-weight:650; }} .muted {{ color:#6e7781; }}
 @media print {{
-  @page {{ size: A4 landscape; margin: 10mm; }}
+  @page {{ size: A4 landscape; margin: 12mm 10mm 14mm; }}
   html, body {{ background:#fff !important; }}
   body {{ max-width:none; padding:0; font-size:10pt; -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
   .doc-header {{ margin-bottom:4mm; }}
   .repo {{ font-size:14pt; }} .path {{ font-size:11pt; }}
   .code-frame {{ overflow:visible; border-color:#aeb6bf; }}
-  .source-table, .diff-table {{ font-size:8.6pt; }}
-  .source-table th, .diff-table th {{ font-size:7.6pt; }}
-  .code code, .hunk code, .meta-line code, .ln, .sign {{ font-size:8.3pt; line-height:1.42; }}
-  .code code {{ white-space:pre-wrap; overflow-wrap:anywhere; }}
+  .source-table, .diff-table {{ font-size:9.2pt; }}
+  .source-table th, .diff-table th {{ font-size:8pt; }}
+  .code code, .hunk code, .meta-line code, .ln, .sign {{ font-size:9pt; line-height:1.5; }}
+  .code code {{ white-space:pre-wrap; overflow-wrap:break-word; word-break:normal; }}
   .file-section {{ break-inside:auto; margin:5mm 0 7mm; }}
   .file-section h2 {{ break-after:avoid; }}
   thead {{ break-after:avoid; }}

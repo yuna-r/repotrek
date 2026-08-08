@@ -8,8 +8,10 @@ mod highlight;
 mod icons;
 mod model;
 mod provider;
+mod settings;
 mod storage;
 mod symbols;
+mod theme;
 mod ui;
 
 use std::{process::Command, str::FromStr, time::Duration};
@@ -21,18 +23,27 @@ use crossterm::event::{self, Event};
 use ratatui::DefaultTerminal;
 
 use crate::{
-    app::{App, AppCommand, CodeSearchMode, RepositoryTab},
+    app::{App, AppCommand, DetailDocument, RepositoryTab},
     cli::Cli,
     icons::Icons,
     model::{ApiResponse, HistoryScreen, RepositoryId},
     provider::{ProviderError, ProviderResult, RepositoryProvider, github::GitHubProvider},
+    settings::{SettingsStore, save_settings},
     storage::HistoryStore,
 };
 
 fn main() -> Result<()> {
     install_panic_hook();
     let cli = Cli::parse();
+
+    let settings_store = SettingsStore::load()?;
+    let mut settings = settings_store.settings().clone();
+    if let Some(theme) = cli.theme {
+        settings.theme = theme;
+    }
+
     let token = auth::token_from_environment(cli.anonymous)
+        .or_else(|| auth::token_from_github_cli(cli.anonymous))
         .or_else(|| auth::token_from_keychain(cli.anonymous));
     let mut provider = GitHubProvider::new(token)?;
     let mut history = HistoryStore::load()?;
@@ -41,6 +52,7 @@ fn main() -> Result<()> {
         history.entries().to_vec(),
         icons,
         provider.is_authenticated(),
+        settings,
     );
 
     let mut terminal = ratatui::try_init().context("Could not initialize terminal")?;
@@ -143,7 +155,7 @@ fn execute_command(
                 terminal,
                 format!("Searching repositories: {query}"),
                 command,
-                || provider.search_repositories(&query, "stars", 30),
+                || provider.search_repositories(&smart_repository_query(&query), "best-match", 50),
             )?;
             if let Some(results) = results {
                 app.set_repository_search_results(query, results);
@@ -223,6 +235,70 @@ fn execute_command(
                 update_history_location(app, history, &id, Some(sha), HistoryScreen::Commit);
             }
         }
+        AppCommand::OpenPullRequest(number) => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let detail = request(
+                app,
+                terminal,
+                format!("Loading pull request #{number}"),
+                command,
+                || provider.pull_request(&id, number),
+            )?;
+            if let Some(detail) = detail {
+                app.open_detail(DetailDocument::PullRequest(detail));
+            }
+        }
+        AppCommand::OpenIssue(number) => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let detail = request(
+                app,
+                terminal,
+                format!("Loading issue #{number}"),
+                command,
+                || provider.issue(&id, number),
+            )?;
+            if let Some(detail) = detail {
+                app.open_detail(DetailDocument::Issue(detail));
+            }
+        }
+        AppCommand::OpenWorkflowRun(run_id) => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let detail = request(
+                app,
+                terminal,
+                format!("Loading workflow run {run_id}"),
+                command,
+                || provider.workflow_run(&id, run_id),
+            )?;
+            if let Some(detail) = detail {
+                app.open_detail(DetailDocument::WorkflowRun(detail));
+            }
+        }
+        AppCommand::OpenRelease(release_id) => {
+            let Some(repository) = app.repository.as_ref() else {
+                return Ok(());
+            };
+            let id = repository.repository.id.clone();
+            let detail = request(
+                app,
+                terminal,
+                format!("Loading release {release_id}"),
+                command,
+                || provider.release(&id, release_id),
+            )?;
+            if let Some(detail) = detail {
+                app.open_detail(DetailDocument::Release(detail));
+            }
+        }
         AppCommand::LoadBranches => {
             let Some(repository) = app.repository.as_ref() else {
                 return Ok(());
@@ -244,8 +320,6 @@ fn execute_command(
                 return Ok(());
             };
             let id = repository.repository.id.clone();
-            // Switching at the repository root is predictable even when the path currently
-            // being viewed does not exist on the target branch.
             let root = String::new();
             let entries = request(
                 app,
@@ -378,6 +452,11 @@ fn execute_command(
             match export::export_commit(repository, &commit.detail) {
                 Ok(path) => app.set_status(format!("Exported {}", path.display())),
                 Err(error) => app.show_error("Print export", error.to_string()),
+            }
+        }
+        AppCommand::PersistSettings => {
+            if let Err(error) = save_settings(&app.settings) {
+                app.show_error("Settings", error.to_string());
             }
         }
         AppCommand::OpenExternal(url) => match open_external(&url) {
@@ -631,10 +710,8 @@ fn finish_token_auth(
             app.auth_user = Some(login.clone());
             app.modal = None;
 
-            let keychain_warning = if persist {
-                auth::save_token_to_keychain(&token)
-                    .err()
-                    .map(|error| error.to_string())
+            let persistence = if persist {
+                Some(auth::save_token_persistently(&token))
             } else {
                 None
             };
@@ -643,16 +720,14 @@ fn finish_token_auth(
                 execute_command(retry, app, provider, history, terminal)?;
             }
 
-            if let Some(warning) = keychain_warning {
-                app.set_status(format!(
-                    "Authenticated as @{login}; Keychain save failed: {warning}"
-                ));
-            } else if persist {
-                app.set_status(format!(
-                    "GitHub authentication enabled for @{login}; token saved in macOS Keychain"
-                ));
-            } else {
-                app.set_status(format!("GitHub authentication enabled for @{login}"));
+            match persistence {
+                Some(Ok(store)) => app.set_status(format!(
+                    "GitHub authentication enabled for @{login}; saved in {store}"
+                )),
+                Some(Err(error)) => app.set_status(format!(
+                    "Authenticated as @{login}; credential save failed: {error}"
+                )),
+                None => app.set_status(format!("GitHub authentication enabled for @{login}")),
             }
         }
         Err(error) => {
@@ -765,6 +840,18 @@ fn open_external(url: &str) -> Result<()> {
 fn parent_path(path: &str) -> String {
     path.rsplit_once('/')
         .map_or_else(String::new, |(parent, _)| parent.to_owned())
+}
+
+fn smart_repository_query(query: &str) -> String {
+    let terms = query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        query.to_owned()
+    } else {
+        format!("{} in:name,description,readme", terms.join(" "))
+    }
 }
 
 fn display_path(path: &str) -> &str {

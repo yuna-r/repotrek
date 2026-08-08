@@ -1,0 +1,70 @@
+--- a/src/provider/github.rs
++++ b/src/provider/github.rs
+@@ -428,23 +428,41 @@ impl RepositoryProvider for GitHubProvider {
+     fn pull_request(&self, id: &RepositoryId, number: u64) -> ProviderResult<PullRequestDetail> {
+         let number_text = number.to_string();
++
++        // PR itself is mandatory.
+         let url = self.repo_url(id, &["pulls", &number_text])?;
+         let response: ApiResponse<PullRequestDto> = self.send_json(self.client.get(url))?;
+         let rate_limit = response.rate_limit.clone();
+         let summary = response.value.clone().into_summary();
+         let detail = response.value;
+
++        // Files and comments are supplementary.
++        // A failure here must not make the whole PR unreadable.
+         let files_url = self.repo_url(id, &["pulls", &number_text, "files"])?;
+-        let files_response: ApiResponse<Vec<CommitFileDto>> = self.send_json(
++        let files = match self.send_json::<Vec<CommitFileDto>>(
+             self.client
+                 .get(files_url)
+                 .query(&[("per_page", "100"), ("page", "1")]),
+-        )?;
++        ) {
++            Ok(response) => response
++                .value
++                .into_iter()
++                .map(CommitFileDto::into_file)
++                .collect(),
++            Err(ProviderError::Api { status: 404, .. }) => Vec::new(),
++            Err(error) => return Err(error),
++        };
+
+         let comments_url = self.repo_url(id, &["issues", &number_text, "comments"])?;
+-        let comments_response: ApiResponse<Vec<CommentDto>> = self.send_json(
++        let comments = match self.send_json::<Vec<CommentDto>>(
+             self.client
+                 .get(comments_url)
+                 .query(&[("per_page", "100"), ("page", "1")]),
+-        )?;
++        ) {
++            Ok(response) => response
++                .value
++                .into_iter()
++                .map(CommentDto::into_comment)
++                .collect(),
++            Err(ProviderError::Api { status: 404, .. }) => Vec::new(),
++            Err(error) => return Err(error),
++        };
+
+         Ok(ApiResponse {
+             value: PullRequestDetail {
+@@ -457,16 +475,8 @@ impl RepositoryProvider for GitHubProvider {
+                 changed_files: detail.changed_files.unwrap_or(0),
+                 additions: detail.additions.unwrap_or(0),
+                 deletions: detail.deletions.unwrap_or(0),
+-                files: files_response
+-                    .value
+-                    .into_iter()
+-                    .map(CommitFileDto::into_file)
+-                    .collect(),
+-                comments: comments_response
+-                    .value
+-                    .into_iter()
+-                    .map(CommentDto::into_comment)
+-                    .collect(),
++                files,
++                comments,
+             },
+             rate_limit,
+         })

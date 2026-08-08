@@ -137,10 +137,18 @@ impl HistoryStore {
         let temporary = temporary_path(&self.path);
         fs::write(&temporary, data)
             .with_context(|| format!("履歴を書き込めません: {}", temporary.display()))?;
-        fs::rename(&temporary, &self.path)
+        replace_file(&temporary, &self.path)
             .with_context(|| format!("履歴を確定できません: {}", self.path.display()))?;
         Ok(())
     }
+}
+
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(source, destination)
 }
 
 fn temporary_path(path: &Path) -> PathBuf {

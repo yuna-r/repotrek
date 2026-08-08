@@ -4,8 +4,9 @@ use thiserror::Error;
 
 use crate::model::{
     ApiResponse, BlameRange, BranchSummary, CodeSearchResult, CommitDetail, CommitSummary,
-    ContentEntry, IssueSummary, PullRequestSummary, RateLimit, ReleaseSummary, RepoCard,
-    Repository, RepositoryId, TreeEntry, WorkflowRunSummary,
+    ContentEntry, IssueDetail, IssueSummary, PullRequestDetail, PullRequestSummary, RateLimit,
+    ReleaseDetail, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry,
+    WorkflowRunDetail, WorkflowRunSummary,
 };
 
 pub type ProviderResult<T> = Result<ApiResponse<T>, ProviderError>;
@@ -119,7 +120,11 @@ pub trait RepositoryProvider {
 
     fn pull_requests(&self, id: &RepositoryId) -> ProviderResult<Vec<PullRequestSummary>>;
 
+    fn pull_request(&self, id: &RepositoryId, number: u64) -> ProviderResult<PullRequestDetail>;
+
     fn issues(&self, id: &RepositoryId) -> ProviderResult<Vec<IssueSummary>>;
+
+    fn issue(&self, id: &RepositoryId, number: u64) -> ProviderResult<IssueDetail>;
 
     fn workflow_runs(
         &self,
@@ -127,7 +132,11 @@ pub trait RepositoryProvider {
         git_ref: &str,
     ) -> ProviderResult<Vec<WorkflowRunSummary>>;
 
+    fn workflow_run(&self, id: &RepositoryId, run_id: u64) -> ProviderResult<WorkflowRunDetail>;
+
     fn releases(&self, id: &RepositoryId) -> ProviderResult<Vec<ReleaseSummary>>;
+
+    fn release(&self, id: &RepositoryId, release_id: u64) -> ProviderResult<ReleaseDetail>;
 
     fn viewer_login(&self) -> ProviderResult<String>;
 }

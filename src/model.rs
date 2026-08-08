@@ -16,6 +16,36 @@ impl RepositoryId {
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
+
+    /// Parse only the exact short form `owner/repo`.
+    /// URLs, SSH remotes, extra path components, and free-form text are intentionally rejected.
+    #[must_use]
+    pub fn from_exact_short(input: &str) -> Option<Self> {
+        let value = input.trim();
+        if value.contains("://") || value.starts_with("git@") || value.ends_with('/') {
+            return None;
+        }
+        let parts = value.split('/').collect::<Vec<_>>();
+        if parts.len() != 2 {
+            return None;
+        }
+        let owner = parts[0];
+        let name = parts[1].trim_end_matches(".git");
+        let valid = |part: &str| {
+            !part.is_empty()
+                && part.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                })
+        };
+        if valid(owner) && valid(name) {
+            Some(Self {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for RepositoryId {
@@ -262,6 +292,78 @@ pub struct ReleaseSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestDetail {
+    pub summary: PullRequestSummary,
+    pub state: String,
+    pub merged: bool,
+    pub body: String,
+    pub commits: u64,
+    pub changed_files: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub files: Vec<CommitFile>,
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueDetail {
+    pub summary: IssueSummary,
+    pub state: String,
+    pub body: String,
+    pub comments: Vec<Comment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowStep {
+    pub number: u64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowJob {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub html_url: String,
+    pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowRunDetail {
+    pub summary: WorkflowRunSummary,
+    pub jobs: Vec<WorkflowJob>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseAsset {
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub download_count: u64,
+    pub browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseDetail {
+    pub summary: ReleaseSummary,
+    pub author: String,
+    pub body: String,
+    pub assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeSearchResult {
     pub name: String,
     pub path: String,
@@ -341,6 +443,16 @@ mod tests {
         let parsed: RepositoryId = "rust-lang/rust".parse().expect("valid repository");
         assert_eq!(parsed.owner, "rust-lang");
         assert_eq!(parsed.name, "rust");
+    }
+
+    #[test]
+    fn exact_short_form_accepts_only_owner_and_repository() {
+        let parsed =
+            RepositoryId::from_exact_short("yuna-r/repotrek").expect("exact owner/repository form");
+        assert_eq!(parsed.full_name(), "yuna-r/repotrek");
+        assert!(RepositoryId::from_exact_short("https://github.com/yuna-r/repotrek").is_none());
+        assert!(RepositoryId::from_exact_short("yuna-r/repotrek/issues").is_none());
+        assert!(RepositoryId::from_exact_short("repotrek source browser").is_none());
     }
 
     #[test]

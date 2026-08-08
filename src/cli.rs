@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use crate::icons::EmojiMode;
+use crate::{icons::EmojiMode, theme::ThemeMode};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -16,7 +16,11 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t = EmojiMode::Auto)]
     pub emoji: EmojiMode,
 
-    /// Ignore environment and Keychain tokens and start anonymously
+    /// Override the saved dark or light theme for this run
+    #[arg(long, value_enum)]
+    pub theme: Option<ThemeMode>,
+
+    /// Ignore saved and environment credentials and start anonymously
     #[arg(long)]
     pub anonymous: bool,
 

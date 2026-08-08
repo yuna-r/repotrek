@@ -1,53 +1,87 @@
+use std::path::Path;
+
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Span,
 };
 
-const KEYWORD: Color = Color::Rgb(255, 123, 114);
-const TYPE: Color = Color::Rgb(121, 192, 255);
-const STRING: Color = Color::Rgb(165, 214, 255);
-const NUMBER: Color = Color::Rgb(121, 192, 255);
-const COMMENT: Color = Color::Rgb(139, 148, 158);
-const FUNCTION: Color = Color::Rgb(210, 168, 255);
-const MACRO: Color = Color::Rgb(255, 166, 87);
-const CONSTANT: Color = Color::Rgb(255, 166, 87);
-const PUNCT: Color = Color::Rgb(201, 209, 217);
+use crate::theme::Theme;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Language {
+    Rust,
+    C,
+    Cpp,
+    CSharp,
+    Java,
+    Kotlin,
+    Swift,
+    Go,
+    Python,
+    Ruby,
+    Shell,
+    JavaScript,
+    TypeScript,
+    Json,
+    Yaml,
+    Toml,
+    Sql,
+    Html,
+    Css,
+    Markdown,
+    Lua,
+    Haskell,
+    Other,
+}
 
 #[must_use]
-pub fn source_spans(line: &str, extension: &str) -> Vec<Span<'static>> {
+pub fn source_spans(line: &str, path: &str, theme: Theme) -> Vec<Span<'static>> {
+    let language = language_for_path(path);
     let expanded = line.replace('\t', "    ");
-    if expanded.trim_start().starts_with('#')
-        && matches!(extension, "c" | "h" | "cc" | "cpp" | "cxx" | "hpp")
-    {
+
+    if is_preprocessor(&expanded, language) {
         return vec![Span::styled(
             expanded,
-            Style::new().fg(MACRO).add_modifier(Modifier::BOLD),
+            Style::new().fg(theme.constant).add_modifier(Modifier::BOLD),
         )];
     }
 
-    let marker = comment_marker(extension);
-    let comment_index = marker.and_then(|marker| find_comment(&expanded, marker));
+    if matches!(language, Language::Markdown) {
+        return markdown_spans(&expanded, theme);
+    }
+    if matches!(language, Language::Json) {
+        return tokenize_json(&expanded, theme);
+    }
+    if matches!(language, Language::Yaml | Language::Toml) {
+        return tokenize_config(&expanded, language, theme);
+    }
+
+    let comment_index =
+        line_comment_marker(language).and_then(|marker| find_comment(&expanded, marker));
     let (code, comment) = comment_index.map_or((expanded.as_str(), None), |index| {
         (&expanded[..index], Some(&expanded[index..]))
     });
 
-    let mut spans = tokenize(code);
+    let mut spans = tokenize_code(code, language, theme);
     if let Some(comment) = comment {
         spans.push(Span::styled(
             comment.to_owned(),
-            Style::new().fg(COMMENT).add_modifier(Modifier::ITALIC),
+            Style::new()
+                .fg(theme.comment)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     spans
 }
 
 #[must_use]
-pub fn source_html(line: &str, extension: &str) -> String {
-    source_spans(line, extension)
+pub fn source_html(line: &str, path: &str) -> String {
+    let theme = Theme::light();
+    source_spans(line, path, theme)
         .into_iter()
         .map(|span| {
             let content = escape_html(span.content.as_ref());
-            let color = html_color(span.style.fg);
+            let color = html_color(span.style.fg, theme.text);
             let mut css = format!("color:{color}");
             if span.style.add_modifier.contains(Modifier::BOLD) {
                 css.push_str(";font-weight:650");
@@ -57,10 +91,11 @@ pub fn source_html(line: &str, extension: &str) -> String {
             }
             format!("<span style=\"{css}\">{content}</span>")
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("")
 }
 
-fn tokenize(code: &str) -> Vec<Span<'static>> {
+fn tokenize_code(code: &str, language: Language, theme: Theme) -> Vec<Span<'static>> {
     let chars = code.chars().collect::<Vec<_>>();
     let mut spans = Vec::new();
     let mut index = 0;
@@ -68,7 +103,7 @@ fn tokenize(code: &str) -> Vec<Span<'static>> {
     while index < chars.len() {
         let character = chars[index];
 
-        if matches!(character, '"' | '\'') {
+        if matches!(character, '"' | '\'') || (character == '`' && supports_backticks(language)) {
             let quote = character;
             let start = index;
             index += 1;
@@ -86,16 +121,16 @@ fn tokenize(code: &str) -> Vec<Span<'static>> {
             }
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
-                Style::new().fg(STRING),
+                Style::new().fg(theme.string),
             ));
             continue;
         }
 
-        if character.is_ascii_alphabetic() || character == '_' {
+        if character.is_alphabetic() || character == '_' || character == '$' {
             let start = index;
             index += 1;
             while index < chars.len()
-                && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+                && (chars[index].is_alphanumeric() || matches!(chars[index], '_' | '$' | '!' | '?'))
             {
                 index += 1;
             }
@@ -106,7 +141,7 @@ fn tokenize(code: &str) -> Vec<Span<'static>> {
                 .find(|ch| !ch.is_whitespace());
             spans.push(Span::styled(
                 token.clone(),
-                token_style(&token, next_non_space),
+                token_style(&token, next_non_space, language, theme),
             ));
             continue;
         }
@@ -116,13 +151,13 @@ fn tokenize(code: &str) -> Vec<Span<'static>> {
             index += 1;
             while index < chars.len()
                 && (chars[index].is_ascii_alphanumeric()
-                    || matches!(chars[index], '.' | '_' | 'x' | 'X'))
+                    || matches!(chars[index], '.' | '_' | '+' | '-'))
             {
                 index += 1;
             }
             spans.push(Span::styled(
                 chars[start..index].iter().collect::<String>(),
-                Style::new().fg(NUMBER),
+                Style::new().fg(theme.number),
             ));
             continue;
         }
@@ -130,205 +165,882 @@ fn tokenize(code: &str) -> Vec<Span<'static>> {
         let start = index;
         index += 1;
         while index < chars.len()
-            && !matches!(chars[index], '"' | '\'')
-            && !chars[index].is_ascii_alphanumeric()
-            && chars[index] != '_'
+            && !matches!(chars[index], '"' | '\'' | '`')
+            && !chars[index].is_alphanumeric()
+            && !matches!(chars[index], '_' | '$')
         {
             index += 1;
         }
         spans.push(Span::styled(
             chars[start..index].iter().collect::<String>(),
-            Style::new().fg(PUNCT),
+            Style::new().fg(theme.punctuation),
         ));
     }
     spans
 }
 
-fn token_style(token: &str, next_non_space: Option<char>) -> Style {
-    if matches!(
-        token,
-        "true" | "false" | "None" | "null" | "nil" | "Some" | "Ok" | "Err"
-    ) {
-        return Style::new().fg(CONSTANT);
+fn tokenize_json(line: &str, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = tokenize_code(line, Language::Json, theme);
+    // JSON property names are strings followed by a colon. The generic tokenizer already
+    // highlights strings; booleans and null are handled as constants.
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), Style::new().fg(theme.text)));
     }
-    if is_keyword(token) {
-        return Style::new().fg(KEYWORD).add_modifier(Modifier::BOLD);
+    spans
+}
+
+fn tokenize_config(line: &str, language: Language, theme: Theme) -> Vec<Span<'static>> {
+    let marker = if language == Language::Yaml { "#" } else { "#" };
+    let comment_index = find_comment(line, marker);
+    let (code, comment) =
+        comment_index.map_or((line, None), |index| (&line[..index], Some(&line[index..])));
+    let separator = if language == Language::Yaml { ':' } else { '=' };
+    let mut spans = Vec::new();
+    if let Some(index) = code.find(separator) {
+        let key = &code[..index];
+        spans.push(Span::styled(
+            key.to_owned(),
+            Style::new().fg(theme.function).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            separator.to_string(),
+            Style::new().fg(theme.punctuation),
+        ));
+        spans.extend(tokenize_code(
+            &code[index + separator.len_utf8()..],
+            language,
+            theme,
+        ));
+    } else {
+        spans.extend(tokenize_code(code, language, theme));
     }
-    if is_builtin_type(token) || token.chars().next().is_some_and(char::is_uppercase) {
-        return Style::new().fg(TYPE);
+    if let Some(comment) = comment {
+        spans.push(Span::styled(
+            comment.to_owned(),
+            Style::new()
+                .fg(theme.comment)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    spans
+}
+
+fn markdown_spans(line: &str, theme: Theme) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        return vec![Span::styled(
+            line.to_owned(),
+            Style::new().fg(theme.function).add_modifier(Modifier::BOLD),
+        )];
+    }
+    if trimmed.starts_with('>') {
+        return vec![Span::styled(
+            line.to_owned(),
+            Style::new()
+                .fg(theme.comment)
+                .add_modifier(Modifier::ITALIC),
+        )];
+    }
+    if trimmed.starts_with("```") {
+        return vec![Span::styled(
+            line.to_owned(),
+            Style::new().fg(theme.constant),
+        )];
+    }
+    vec![Span::styled(line.to_owned(), Style::new().fg(theme.text))]
+}
+
+fn token_style(
+    token: &str,
+    next_non_space: Option<char>,
+    language: Language,
+    theme: Theme,
+) -> Style {
+    if is_constant(token, language) {
+        return Style::new().fg(theme.constant);
+    }
+    if is_keyword(token, language) {
+        return Style::new().fg(theme.keyword).add_modifier(Modifier::BOLD);
+    }
+    if is_builtin_type(token, language) || token.chars().next().is_some_and(char::is_uppercase) {
+        return Style::new().fg(theme.type_name);
     }
     if next_non_space == Some('(') {
-        return Style::new().fg(FUNCTION);
+        return Style::new().fg(theme.function);
     }
     if token
         .chars()
         .all(|ch| ch.is_ascii_uppercase() || ch == '_' || ch.is_ascii_digit())
         && token.chars().any(char::is_alphabetic)
     {
-        return Style::new().fg(CONSTANT);
+        return Style::new().fg(theme.constant);
     }
-    Style::new().fg(Color::Rgb(230, 237, 243))
+    Style::new().fg(theme.text)
 }
 
-fn is_builtin_type(token: &str) -> bool {
-    matches!(
-        token,
-        "bool"
-            | "char"
-            | "str"
-            | "String"
-            | "usize"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "f32"
-            | "f64"
-            | "int"
-            | "long"
-            | "float"
-            | "double"
-            | "void"
-            | "bytes"
-            | "dict"
-            | "list"
-            | "tuple"
-    )
+fn is_constant(token: &str, language: Language) -> bool {
+    match language {
+        Language::Python => matches!(token, "True" | "False" | "None"),
+        Language::Ruby => matches!(token, "true" | "false" | "nil"),
+        Language::Rust => matches!(token, "true" | "false" | "Some" | "None" | "Ok" | "Err"),
+        _ => matches!(token, "true" | "false" | "null" | "nil"),
+    }
 }
 
-fn is_keyword(token: &str) -> bool {
-    matches!(
-        token,
-        "as" | "async"
-            | "await"
-            | "break"
-            | "case"
-            | "catch"
-            | "class"
-            | "const"
-            | "continue"
-            | "crate"
-            | "def"
-            | "defer"
-            | "do"
-            | "dyn"
-            | "else"
-            | "enum"
-            | "except"
-            | "export"
-            | "extends"
-            | "extern"
-            | "finally"
-            | "fn"
-            | "for"
-            | "from"
-            | "func"
-            | "function"
-            | "if"
-            | "impl"
-            | "import"
-            | "in"
-            | "interface"
-            | "let"
-            | "loop"
-            | "match"
-            | "mod"
-            | "move"
-            | "mut"
-            | "namespace"
-            | "new"
-            | "package"
-            | "pass"
-            | "private"
-            | "protected"
-            | "pub"
-            | "public"
-            | "raise"
-            | "ref"
-            | "return"
-            | "self"
-            | "Self"
-            | "static"
-            | "struct"
-            | "super"
-            | "switch"
-            | "throw"
-            | "trait"
-            | "try"
-            | "type"
-            | "typeof"
-            | "unsafe"
-            | "use"
-            | "var"
-            | "where"
-            | "while"
-            | "with"
-            | "yield"
-    )
+fn is_builtin_type(token: &str, language: Language) -> bool {
+    match language {
+        Language::Rust => matches!(
+            token,
+            "bool"
+                | "char"
+                | "str"
+                | "String"
+                | "usize"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "f32"
+                | "f64"
+                | "Self"
+                | "Option"
+                | "Result"
+                | "Vec"
+                | "Box"
+        ),
+        Language::C | Language::Cpp => matches!(
+            token,
+            "void"
+                | "char"
+                | "short"
+                | "int"
+                | "long"
+                | "float"
+                | "double"
+                | "signed"
+                | "unsigned"
+                | "size_t"
+                | "bool"
+                | "wchar_t"
+                | "auto"
+        ),
+        Language::CSharp => matches!(
+            token,
+            "bool"
+                | "byte"
+                | "sbyte"
+                | "char"
+                | "decimal"
+                | "double"
+                | "float"
+                | "int"
+                | "uint"
+                | "long"
+                | "ulong"
+                | "short"
+                | "ushort"
+                | "object"
+                | "string"
+        ),
+        Language::Java | Language::Kotlin => matches!(
+            token,
+            "boolean"
+                | "byte"
+                | "char"
+                | "double"
+                | "float"
+                | "int"
+                | "long"
+                | "short"
+                | "void"
+                | "String"
+                | "Any"
+                | "Unit"
+        ),
+        Language::Go => matches!(
+            token,
+            "bool"
+                | "byte"
+                | "complex64"
+                | "complex128"
+                | "error"
+                | "float32"
+                | "float64"
+                | "int"
+                | "int8"
+                | "int16"
+                | "int32"
+                | "int64"
+                | "rune"
+                | "string"
+                | "uint"
+                | "uint8"
+                | "uint16"
+                | "uint32"
+                | "uint64"
+                | "uintptr"
+        ),
+        Language::Python => matches!(
+            token,
+            "str" | "int" | "float" | "bool" | "bytes" | "dict" | "list" | "tuple" | "set"
+        ),
+        Language::TypeScript => matches!(
+            token,
+            "string" | "number" | "boolean" | "unknown" | "never" | "any" | "void"
+        ),
+        _ => false,
+    }
 }
 
-fn comment_marker(extension: &str) -> Option<&'static str> {
-    match extension.to_ascii_lowercase().as_str() {
-        "rs" | "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "java" | "js" | "jsx" | "ts" | "tsx"
-        | "go" | "swift" | "kt" | "kts" | "cs" | "scala" => Some("//"),
-        "py" | "rb" | "sh" | "bash" | "zsh" | "fish" | "yaml" | "yml" | "toml" | "r" | "pl" => {
+fn is_keyword(token: &str, language: Language) -> bool {
+    match language {
+        Language::Rust => matches!(
+            token,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "const"
+                | "continue"
+                | "crate"
+                | "dyn"
+                | "else"
+                | "enum"
+                | "extern"
+                | "false"
+                | "fn"
+                | "for"
+                | "if"
+                | "impl"
+                | "in"
+                | "let"
+                | "loop"
+                | "match"
+                | "mod"
+                | "move"
+                | "mut"
+                | "pub"
+                | "ref"
+                | "return"
+                | "self"
+                | "Self"
+                | "static"
+                | "struct"
+                | "super"
+                | "trait"
+                | "true"
+                | "type"
+                | "unsafe"
+                | "use"
+                | "where"
+                | "while"
+                | "yield"
+        ),
+        Language::C | Language::Cpp => matches!(
+            token,
+            "alignas"
+                | "alignof"
+                | "asm"
+                | "auto"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "constexpr"
+                | "continue"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "explicit"
+                | "export"
+                | "extern"
+                | "for"
+                | "friend"
+                | "goto"
+                | "if"
+                | "inline"
+                | "mutable"
+                | "namespace"
+                | "new"
+                | "noexcept"
+                | "operator"
+                | "private"
+                | "protected"
+                | "public"
+                | "register"
+                | "return"
+                | "sizeof"
+                | "static"
+                | "struct"
+                | "switch"
+                | "template"
+                | "this"
+                | "throw"
+                | "try"
+                | "typedef"
+                | "typename"
+                | "union"
+                | "using"
+                | "virtual"
+                | "volatile"
+                | "while"
+        ),
+        Language::CSharp => matches!(
+            token,
+            "abstract"
+                | "as"
+                | "async"
+                | "await"
+                | "base"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "delegate"
+                | "do"
+                | "else"
+                | "enum"
+                | "event"
+                | "explicit"
+                | "extern"
+                | "finally"
+                | "fixed"
+                | "for"
+                | "foreach"
+                | "if"
+                | "implicit"
+                | "in"
+                | "interface"
+                | "internal"
+                | "is"
+                | "lock"
+                | "namespace"
+                | "new"
+                | "operator"
+                | "out"
+                | "override"
+                | "params"
+                | "private"
+                | "protected"
+                | "public"
+                | "readonly"
+                | "ref"
+                | "return"
+                | "sealed"
+                | "static"
+                | "struct"
+                | "switch"
+                | "this"
+                | "throw"
+                | "try"
+                | "typeof"
+                | "using"
+                | "virtual"
+                | "volatile"
+                | "while"
+                | "yield"
+        ),
+        Language::Java => matches!(
+            token,
+            "abstract"
+                | "assert"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "default"
+                | "do"
+                | "else"
+                | "enum"
+                | "extends"
+                | "final"
+                | "finally"
+                | "for"
+                | "goto"
+                | "if"
+                | "implements"
+                | "import"
+                | "instanceof"
+                | "interface"
+                | "native"
+                | "new"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "static"
+                | "strictfp"
+                | "super"
+                | "switch"
+                | "synchronized"
+                | "this"
+                | "throw"
+                | "throws"
+                | "transient"
+                | "try"
+                | "volatile"
+                | "while"
+        ),
+        Language::Kotlin => matches!(
+            token,
+            "as" | "break"
+                | "class"
+                | "continue"
+                | "do"
+                | "else"
+                | "false"
+                | "for"
+                | "fun"
+                | "if"
+                | "in"
+                | "interface"
+                | "is"
+                | "null"
+                | "object"
+                | "package"
+                | "return"
+                | "super"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typealias"
+                | "typeof"
+                | "val"
+                | "var"
+                | "when"
+                | "while"
+        ),
+        Language::Swift => matches!(
+            token,
+            "associatedtype"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "continue"
+                | "default"
+                | "defer"
+                | "deinit"
+                | "do"
+                | "else"
+                | "enum"
+                | "extension"
+                | "fallthrough"
+                | "for"
+                | "func"
+                | "guard"
+                | "if"
+                | "import"
+                | "in"
+                | "init"
+                | "inout"
+                | "internal"
+                | "let"
+                | "open"
+                | "operator"
+                | "private"
+                | "protocol"
+                | "public"
+                | "repeat"
+                | "return"
+                | "static"
+                | "struct"
+                | "subscript"
+                | "switch"
+                | "throw"
+                | "throws"
+                | "try"
+                | "typealias"
+                | "var"
+                | "where"
+                | "while"
+        ),
+        Language::Go => matches!(
+            token,
+            "break"
+                | "case"
+                | "chan"
+                | "const"
+                | "continue"
+                | "default"
+                | "defer"
+                | "else"
+                | "fallthrough"
+                | "for"
+                | "func"
+                | "go"
+                | "goto"
+                | "if"
+                | "import"
+                | "interface"
+                | "map"
+                | "package"
+                | "range"
+                | "return"
+                | "select"
+                | "struct"
+                | "switch"
+                | "type"
+                | "var"
+        ),
+        Language::Python => matches!(
+            token,
+            "and"
+                | "as"
+                | "assert"
+                | "async"
+                | "await"
+                | "break"
+                | "class"
+                | "continue"
+                | "def"
+                | "del"
+                | "elif"
+                | "else"
+                | "except"
+                | "finally"
+                | "for"
+                | "from"
+                | "global"
+                | "if"
+                | "import"
+                | "in"
+                | "is"
+                | "lambda"
+                | "nonlocal"
+                | "not"
+                | "or"
+                | "pass"
+                | "raise"
+                | "return"
+                | "try"
+                | "while"
+                | "with"
+                | "yield"
+        ),
+        Language::Ruby => matches!(
+            token,
+            "alias"
+                | "and"
+                | "begin"
+                | "break"
+                | "case"
+                | "class"
+                | "def"
+                | "defined"
+                | "do"
+                | "else"
+                | "elsif"
+                | "end"
+                | "ensure"
+                | "for"
+                | "if"
+                | "in"
+                | "module"
+                | "next"
+                | "not"
+                | "or"
+                | "redo"
+                | "rescue"
+                | "retry"
+                | "return"
+                | "super"
+                | "then"
+                | "undef"
+                | "unless"
+                | "until"
+                | "when"
+                | "while"
+                | "yield"
+        ),
+        Language::Shell => matches!(
+            token,
+            "case"
+                | "do"
+                | "done"
+                | "elif"
+                | "else"
+                | "esac"
+                | "fi"
+                | "for"
+                | "function"
+                | "if"
+                | "in"
+                | "select"
+                | "then"
+                | "time"
+                | "until"
+                | "while"
+        ),
+        Language::JavaScript | Language::TypeScript => matches!(
+            token,
+            "as" | "async"
+                | "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "finally"
+                | "for"
+                | "from"
+                | "function"
+                | "get"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "new"
+                | "of"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "set"
+                | "static"
+                | "super"
+                | "switch"
+                | "throw"
+                | "try"
+                | "type"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "yield"
+        ),
+        Language::Sql => matches!(
+            token.to_ascii_uppercase().as_str(),
+            "SELECT"
+                | "FROM"
+                | "WHERE"
+                | "INSERT"
+                | "INTO"
+                | "UPDATE"
+                | "DELETE"
+                | "CREATE"
+                | "ALTER"
+                | "DROP"
+                | "TABLE"
+                | "INDEX"
+                | "JOIN"
+                | "LEFT"
+                | "RIGHT"
+                | "INNER"
+                | "OUTER"
+                | "ON"
+                | "AS"
+                | "AND"
+                | "OR"
+                | "NOT"
+                | "NULL"
+                | "VALUES"
+                | "GROUP"
+                | "BY"
+                | "ORDER"
+                | "HAVING"
+                | "LIMIT"
+                | "OFFSET"
+                | "UNION"
+        ),
+        Language::Lua => matches!(
+            token,
+            "and"
+                | "break"
+                | "do"
+                | "else"
+                | "elseif"
+                | "end"
+                | "false"
+                | "for"
+                | "function"
+                | "goto"
+                | "if"
+                | "in"
+                | "local"
+                | "nil"
+                | "not"
+                | "or"
+                | "repeat"
+                | "return"
+                | "then"
+                | "true"
+                | "until"
+                | "while"
+        ),
+        Language::Haskell => matches!(
+            token,
+            "case"
+                | "class"
+                | "data"
+                | "default"
+                | "deriving"
+                | "do"
+                | "else"
+                | "foreign"
+                | "if"
+                | "import"
+                | "in"
+                | "infix"
+                | "infixl"
+                | "infixr"
+                | "instance"
+                | "let"
+                | "module"
+                | "newtype"
+                | "of"
+                | "then"
+                | "type"
+                | "where"
+        ),
+        Language::Json
+        | Language::Yaml
+        | Language::Toml
+        | Language::Html
+        | Language::Css
+        | Language::Markdown
+        | Language::Other => false,
+    }
+}
+
+fn language_for_path(path: &str) -> Language {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "rs" => Language::Rust,
+        "c" | "h" => Language::C,
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
+        "cs" => Language::CSharp,
+        "java" => Language::Java,
+        "kt" | "kts" => Language::Kotlin,
+        "swift" => Language::Swift,
+        "go" => Language::Go,
+        "py" | "pyi" => Language::Python,
+        "rb" => Language::Ruby,
+        "sh" | "bash" | "zsh" | "fish" => Language::Shell,
+        "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
+        "ts" | "tsx" | "mts" | "cts" => Language::TypeScript,
+        "json" | "jsonc" => Language::Json,
+        "yaml" | "yml" => Language::Yaml,
+        "toml" => Language::Toml,
+        "sql" => Language::Sql,
+        "html" | "htm" | "xml" | "svg" => Language::Html,
+        "css" | "scss" | "sass" | "less" => Language::Css,
+        "md" | "markdown" | "mdx" => Language::Markdown,
+        "lua" => Language::Lua,
+        "hs" | "lhs" => Language::Haskell,
+        _ if matches!(file_name.as_str(), "dockerfile" | "makefile") => Language::Shell,
+        _ => Language::Other,
+    }
+}
+
+fn line_comment_marker(language: Language) -> Option<&'static str> {
+    match language {
+        Language::Rust
+        | Language::C
+        | Language::Cpp
+        | Language::CSharp
+        | Language::Java
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Go
+        | Language::JavaScript
+        | Language::TypeScript => Some("//"),
+        Language::Python | Language::Ruby | Language::Shell | Language::Yaml | Language::Toml => {
             Some("#")
         }
-        "sql" | "lua" | "hs" => Some("--"),
-        _ => None,
+        Language::Sql | Language::Lua | Language::Haskell => Some("--"),
+        Language::Json | Language::Html | Language::Css | Language::Markdown | Language::Other => {
+            None
+        }
     }
+}
+
+fn is_preprocessor(line: &str, language: Language) -> bool {
+    line.trim_start().starts_with('#') && matches!(language, Language::C | Language::Cpp)
+}
+
+fn supports_backticks(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Shell
+    )
 }
 
 fn find_comment(line: &str, marker: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
     let bytes = line.as_bytes();
     let marker = marker.as_bytes();
-    let mut quote: Option<u8> = None;
-    let mut escaped = false;
     let mut index = 0;
     while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(active_quote) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == active_quote {
+        let current = bytes[index] as char;
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if current == '\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if matches!(current, '"' | '\'' | '`') {
+            if quote == Some(current) {
                 quote = None;
+            } else if quote.is_none() {
+                quote = Some(current);
             }
             index += 1;
             continue;
         }
-        if matches!(byte, b'"' | b'\'') {
-            quote = Some(byte);
-            index += 1;
-            continue;
-        }
-        if bytes[index..].starts_with(marker) {
+        if quote.is_none()
+            && index + marker.len() <= bytes.len()
+            && &bytes[index..index + marker.len()] == marker
+        {
             return Some(index);
         }
         index += 1;
     }
     None
-}
-
-fn html_color(color: Option<Color>) -> &'static str {
-    match color {
-        Some(Color::Rgb(255, 123, 114)) => "#cf222e",
-        Some(Color::Rgb(121, 192, 255)) => "#0550ae",
-        Some(Color::Rgb(165, 214, 255)) => "#0a3069",
-        Some(Color::Rgb(139, 148, 158)) => "#6e7781",
-        Some(Color::Rgb(210, 168, 255)) => "#8250df",
-        Some(Color::Rgb(255, 166, 87)) => "#953800",
-        Some(Color::Rgb(201, 209, 217)) => "#24292f",
-        _ => "#24292f",
-    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -337,5 +1049,35 @@ fn escape_html(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+}
+
+fn html_color(color: Option<ratatui::style::Color>, fallback: ratatui::style::Color) -> String {
+    let color = color.unwrap_or(fallback);
+    match color {
+        ratatui::style::Color::Rgb(red, green, blue) => format!("#{red:02x}{green:02x}{blue:02x}"),
+        _ => "#1f2328".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Language, language_for_path, source_spans};
+    use crate::theme::Theme;
+
+    #[test]
+    fn detects_common_languages() {
+        assert_eq!(language_for_path("src/main.rs"), Language::Rust);
+        assert_eq!(language_for_path("app.py"), Language::Python);
+        assert_eq!(language_for_path("web.tsx"), Language::TypeScript);
+        assert_eq!(language_for_path("main.go"), Language::Go);
+        assert_eq!(language_for_path("config.yaml"), Language::Yaml);
+    }
+
+    #[test]
+    fn highlights_keywords_per_language() {
+        let rust = source_spans("pub fn main() {}", "src/main.rs", Theme::dark());
+        let python = source_spans("def main():", "main.py", Theme::light());
+        assert!(rust.len() > 1);
+        assert!(python.len() > 1);
+    }
 }

@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     model::{
-        ApiResponse, BlameRange, BranchSummary, CodeSearchResult, CommitDetail, CommitFile,
-        CommitStats, CommitSummary, ContentEntry, ContentKind, IssueSummary, PullRequestSummary,
-        RateLimit, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry,
-        WorkflowRunSummary,
+        ApiResponse, BlameRange, BranchSummary, CodeSearchResult, Comment, CommitDetail,
+        CommitFile, CommitStats, CommitSummary, ContentEntry, ContentKind, IssueDetail,
+        IssueSummary, PullRequestDetail, PullRequestSummary, RateLimit, ReleaseAsset,
+        ReleaseDetail, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry, WorkflowJob,
+        WorkflowRunDetail, WorkflowRunSummary, WorkflowStep,
     },
     provider::{ProviderError, ProviderResult, RepositoryProvider},
 };
@@ -83,6 +84,44 @@ impl GitHubProvider {
             .json::<T>()
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
         Ok(ApiResponse { value, rate_limit })
+    }
+
+    /// Retry a public GitHub REST request once without Authorization when a
+    /// fine-grained token hides an otherwise public resource behind HTTP 404.
+    fn send_json_public_fallback<T>(&self, request: RequestBuilder) -> ProviderResult<T>
+    where
+        T: DeserializeOwned,
+    {
+        let anonymous_request = request.try_clone();
+
+        match self.send_json(request) {
+            Err(original @ ProviderError::Api { status: 404, .. }) if self.token.is_some() => {
+                let Some(anonymous_request) = anonymous_request else {
+                    return Err(original);
+                };
+
+                // Deliberately do not call self.request() here: it would attach
+                // the stored Authorization header again.
+                let response = anonymous_request
+                    .header(ACCEPT, JSON_ACCEPT)
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .send()?;
+                let rate_limit = parse_rate_limit(response.headers());
+                let response = match ensure_success(response, rate_limit.clone()) {
+                    Ok(response) => response,
+                    // Preserve the authenticated 404 if GitHub also returns 404
+                    // anonymously. pull_requests() can then treat that as an
+                    // unavailable/restricted PR surface.
+                    Err(ProviderError::Api { status: 404, .. }) => return Err(original),
+                    Err(error) => return Err(error),
+                };
+                let value = response
+                    .json::<T>()
+                    .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+                Ok(ApiResponse { value, rate_limit })
+            }
+            result => result,
+        }
     }
 
     fn send_text(&self, request: RequestBuilder) -> ProviderResult<String> {
@@ -360,13 +399,14 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
     ) -> ProviderResult<Vec<RepoCard>> {
         let url = Url::parse("https://api.github.com/search/repositories")
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
-        let response: ApiResponse<SearchRepositoryResponseDto> =
-            self.send_json(self.client.get(url).query(&[
-                ("q", query.to_owned()),
-                ("sort", sort.to_owned()),
-                ("order", "desc".to_owned()),
-                ("per_page", per_page.clamp(1, 30).to_string()),
-            ]))?;
+        let mut request = self.client.get(url).query(&[
+            ("q", query.to_owned()),
+            ("per_page", per_page.clamp(1, 30).to_string()),
+        ]);
+        if !sort.is_empty() && sort != "best-match" {
+            request = request.query(&[("sort", sort), ("order", "desc")]);
+        }
+        let response: ApiResponse<SearchRepositoryResponseDto> = self.send_json(request)?;
         Ok(ApiResponse {
             value: response
                 .value
@@ -406,19 +446,92 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
 
     fn pull_requests(&self, id: &RepositoryId) -> ProviderResult<Vec<PullRequestSummary>> {
         let url = self.repo_url(id, &["pulls"])?;
-        let response: ApiResponse<Vec<PullRequestDto>> =
-            self.send_json(self.client.get(url).query(&[
+        let result: ProviderResult<Vec<PullRequestDto>> =
+            self.send_json_public_fallback(self.client.get(url).query(&[
                 ("state", "open"),
                 ("sort", "updated"),
                 ("per_page", "50"),
-            ]))?;
-        Ok(ApiResponse {
-            value: response
+            ]));
+
+        match result {
+            Ok(response) => Ok(ApiResponse {
+                value: response
+                    .value
+                    .into_iter()
+                    .map(PullRequestDto::into_summary)
+                    .collect(),
+                rate_limit: response.rate_limit,
+            }),
+            // Some public repositories intentionally do not expose pull requests.
+            // In that case GitHub returns 404 even though the repository itself is readable.
+            Err(ProviderError::Api {
+                status: 404,
+                rate_limit,
+                ..
+            }) => Ok(ApiResponse {
+                value: Vec::new(),
+                rate_limit,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn pull_request(&self, id: &RepositoryId, number: u64) -> ProviderResult<PullRequestDetail> {
+        let number_text = number.to_string();
+
+        // The pull request itself is mandatory. Supplementary resources such as
+        // changed files and conversation comments are loaded best-effort below so
+        // that an unavailable secondary endpoint does not make the whole PR unreadable.
+        let url = self.repo_url(id, &["pulls", &number_text])?;
+        let response: ApiResponse<PullRequestDto> = self.send_json(self.client.get(url))?;
+        let rate_limit = response.rate_limit.clone();
+        let summary = response.value.clone().into_summary();
+        let detail = response.value;
+
+        let files_url = self.repo_url(id, &["pulls", &number_text, "files"])?;
+        let files = match self.send_json::<Vec<CommitFileDto>>(
+            self.client
+                .get(files_url)
+                .query(&[("per_page", "100"), ("page", "1")]),
+        ) {
+            Ok(response) => response
                 .value
                 .into_iter()
-                .map(PullRequestDto::into_summary)
+                .map(CommitFileDto::into_file)
                 .collect(),
-            rate_limit: response.rate_limit,
+            Err(ProviderError::Api { status: 404, .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+
+        let comments_url = self.repo_url(id, &["issues", &number_text, "comments"])?;
+        let comments = match self.send_json::<Vec<CommentDto>>(
+            self.client
+                .get(comments_url)
+                .query(&[("per_page", "100"), ("page", "1")]),
+        ) {
+            Ok(response) => response
+                .value
+                .into_iter()
+                .map(CommentDto::into_comment)
+                .collect(),
+            Err(ProviderError::Api { status: 404, .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+
+        Ok(ApiResponse {
+            value: PullRequestDetail {
+                summary,
+                state: detail.state.unwrap_or_else(|| "unknown".to_owned()),
+                merged: detail.merged.unwrap_or(false),
+                body: detail.body.unwrap_or_default(),
+                commits: detail.commits.unwrap_or(0),
+                changed_files: detail.changed_files.unwrap_or(0),
+                additions: detail.additions.unwrap_or(0),
+                deletions: detail.deletions.unwrap_or(0),
+                files,
+                comments,
+            },
+            rate_limit,
         })
     }
 
@@ -438,6 +551,36 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
                 .map(IssueDto::into_summary)
                 .collect(),
             rate_limit: response.rate_limit,
+        })
+    }
+
+    fn issue(&self, id: &RepositoryId, number: u64) -> ProviderResult<IssueDetail> {
+        let number_text = number.to_string();
+        let url = self.repo_url(id, &["issues", &number_text])?;
+        let response: ApiResponse<IssueDto> = self.send_json(self.client.get(url))?;
+        let rate_limit = response.rate_limit.clone();
+        let summary = response.value.clone().into_summary();
+        let detail = response.value;
+
+        let comments_url = self.repo_url(id, &["issues", &number_text, "comments"])?;
+        let comments_response: ApiResponse<Vec<CommentDto>> = self.send_json(
+            self.client
+                .get(comments_url)
+                .query(&[("per_page", "100"), ("page", "1")]),
+        )?;
+
+        Ok(ApiResponse {
+            value: IssueDetail {
+                summary,
+                state: detail.state.unwrap_or_else(|| "unknown".to_owned()),
+                body: detail.body.unwrap_or_default(),
+                comments: comments_response
+                    .value
+                    .into_iter()
+                    .map(CommentDto::into_comment)
+                    .collect(),
+            },
+            rate_limit,
         })
     }
 
@@ -463,6 +606,34 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
         })
     }
 
+    fn workflow_run(&self, id: &RepositoryId, run_id: u64) -> ProviderResult<WorkflowRunDetail> {
+        let run_id_text = run_id.to_string();
+        let url = self.repo_url(id, &["actions", "runs", &run_id_text])?;
+        let response: ApiResponse<WorkflowRunDto> = self.send_json(self.client.get(url))?;
+        let rate_limit = response.rate_limit.clone();
+        let summary = response.value.into_summary();
+
+        let jobs_url = self.repo_url(id, &["actions", "runs", &run_id_text, "jobs"])?;
+        let jobs_response: ApiResponse<WorkflowJobsResponseDto> = self.send_json(
+            self.client
+                .get(jobs_url)
+                .query(&[("per_page", "100"), ("page", "1")]),
+        )?;
+
+        Ok(ApiResponse {
+            value: WorkflowRunDetail {
+                summary,
+                jobs: jobs_response
+                    .value
+                    .jobs
+                    .into_iter()
+                    .map(WorkflowJobDto::into_job)
+                    .collect(),
+            },
+            rate_limit,
+        })
+    }
+
     fn releases(&self, id: &RepositoryId) -> ProviderResult<Vec<ReleaseSummary>> {
         let url = self.repo_url(id, &["releases"])?;
         let response: ApiResponse<Vec<ReleaseDto>> = self.send_json(
@@ -477,6 +648,31 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
                 .map(ReleaseDto::into_summary)
                 .collect(),
             rate_limit: response.rate_limit,
+        })
+    }
+
+    fn release(&self, id: &RepositoryId, release_id: u64) -> ProviderResult<ReleaseDetail> {
+        let release_id_text = release_id.to_string();
+        let url = self.repo_url(id, &["releases", &release_id_text])?;
+        let response: ApiResponse<ReleaseDto> = self.send_json(self.client.get(url))?;
+        let rate_limit = response.rate_limit.clone();
+        let detail = response.value;
+        let summary = detail.clone().into_summary();
+        Ok(ApiResponse {
+            value: ReleaseDetail {
+                summary,
+                author: detail
+                    .author
+                    .map_or_else(|| "Unknown".to_owned(), |author| author.login),
+                body: detail.body.unwrap_or_default(),
+                assets: detail
+                    .assets
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(ReleaseAssetDto::into_asset)
+                    .collect(),
+            },
+            rate_limit,
         })
     }
 
@@ -497,6 +693,7 @@ fn ensure_success(response: Response, rate_limit: RateLimit) -> Result<Response,
         return Ok(response);
     }
 
+    let request_url = response.url().to_string();
     let retry_after_seconds = response
         .headers()
         .get(RETRY_AFTER)
@@ -526,12 +723,7 @@ fn ensure_success(response: Response, rate_limit: RateLimit) -> Result<Response,
         status,
         StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
     ) {
-        if rate_limit.exhausted()
-            && rate_limit
-                .resource
-                .as_deref()
-                .is_none_or(|resource| resource == "core")
-        {
+        if rate_limit.exhausted() {
             return Err(ProviderError::RateLimited(rate_limit));
         }
         return Err(ProviderError::TemporarilyLimited {
@@ -543,7 +735,7 @@ fn ensure_success(response: Response, rate_limit: RateLimit) -> Result<Response,
 
     Err(ProviderError::Api {
         status: status.as_u16(),
-        message,
+        message: format!("{message} [{request_url}]"),
         rate_limit,
     })
 }
@@ -902,7 +1094,7 @@ impl SearchCodeItemDto {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PullRequestDto {
     number: u64,
     title: String,
@@ -913,9 +1105,16 @@ struct PullRequestDto {
     comments: Option<u64>,
     updated_at: DateTime<Utc>,
     html_url: String,
+    state: Option<String>,
+    merged: Option<bool>,
+    body: Option<String>,
+    commits: Option<u64>,
+    changed_files: Option<u64>,
+    additions: Option<u64>,
+    deletions: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct PullRefDto {
     #[serde(rename = "ref")]
     git_ref: String,
@@ -937,7 +1136,7 @@ impl PullRequestDto {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct IssueDto {
     number: u64,
     title: String,
@@ -947,9 +1146,11 @@ struct IssueDto {
     updated_at: DateTime<Utc>,
     html_url: String,
     pull_request: Option<serde_json::Value>,
+    state: Option<String>,
+    body: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct LabelDto {
     name: String,
 }
@@ -1000,7 +1201,7 @@ impl WorkflowRunDto {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ReleaseDto {
     id: u64,
     tag_name: String,
@@ -1009,6 +1210,9 @@ struct ReleaseDto {
     prerelease: bool,
     published_at: Option<DateTime<Utc>>,
     html_url: String,
+    author: Option<OwnerDto>,
+    body: Option<String>,
+    assets: Option<Vec<ReleaseAssetDto>>,
 }
 
 impl ReleaseDto {
@@ -1021,6 +1225,100 @@ impl ReleaseDto {
             prerelease: self.prerelease,
             published_at: self.published_at,
             html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CommentDto {
+    id: u64,
+    user: OwnerDto,
+    body: Option<String>,
+    created_at: DateTime<Utc>,
+    html_url: String,
+}
+
+impl CommentDto {
+    fn into_comment(self) -> Comment {
+        Comment {
+            id: self.id,
+            author: self.user.login,
+            body: self.body.unwrap_or_default(),
+            created_at: self.created_at,
+            html_url: self.html_url,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowJobsResponseDto {
+    jobs: Vec<WorkflowJobDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowJobDto {
+    id: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    html_url: String,
+    steps: Option<Vec<WorkflowStepDto>>,
+}
+
+impl WorkflowJobDto {
+    fn into_job(self) -> WorkflowJob {
+        WorkflowJob {
+            id: self.id,
+            name: self.name,
+            status: self.status,
+            conclusion: self.conclusion,
+            html_url: self.html_url,
+            steps: self
+                .steps
+                .unwrap_or_default()
+                .into_iter()
+                .map(WorkflowStepDto::into_step)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowStepDto {
+    number: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+}
+
+impl WorkflowStepDto {
+    fn into_step(self) -> WorkflowStep {
+        WorkflowStep {
+            number: self.number,
+            name: self.name,
+            status: self.status,
+            conclusion: self.conclusion,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseAssetDto {
+    id: u64,
+    name: String,
+    size: u64,
+    download_count: u64,
+    browser_download_url: String,
+}
+
+impl ReleaseAssetDto {
+    fn into_asset(self) -> ReleaseAsset {
+        ReleaseAsset {
+            id: self.id,
+            name: self.name,
+            size: self.size,
+            download_count: self.download_count,
+            browser_download_url: self.browser_download_url,
         }
     }
 }
