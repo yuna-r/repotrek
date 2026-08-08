@@ -18,12 +18,15 @@ pub fn export_file(
     path: &str,
     content: &str,
 ) -> Result<PathBuf> {
-    let filename = format!(
-        "repotrek-{}-{}.html",
+    let now = Local::now();
+    let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let generated = now.format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    let stem = format!(
+        "repotrek-{}-{}",
         sanitize_filename(&repository.full_name),
         sanitize_filename(path)
     );
-    let output = std::env::current_dir()?.join(filename);
+    let output = export_output_path(&stem, &timestamp)?;
     let rows = content
         .lines()
         .enumerate()
@@ -55,7 +58,7 @@ pub fn export_file(
         repo = escape_html(&repository.full_name),
         path = escape_html(path),
         git_ref = escape_html(git_ref),
-        generated = Local::now().format("%Y-%m-%d %H:%M %Z"),
+        generated = generated,
         line_count = content.lines().count(),
     );
     write_document(
@@ -67,12 +70,15 @@ pub fn export_file(
 }
 
 pub fn export_commit(repository: &Repository, detail: &CommitDetail) -> Result<PathBuf> {
-    let filename = format!(
-        "repotrek-{}-commit-{}.html",
+    let now = Local::now();
+    let timestamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let generated = now.format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    let stem = format!(
+        "repotrek-{}-commit-{}",
         sanitize_filename(&repository.full_name),
         sanitize_filename(detail.summary.short_sha())
     );
-    let output = std::env::current_dir()?.join(filename);
+    let output = export_output_path(&stem, &timestamp)?;
     let mut files_html = String::new();
 
     for file in &detail.files {
@@ -165,7 +171,7 @@ pub fn export_commit(repository: &Repository, detail: &CommitDetail) -> Result<P
 "#,
         repo = escape_html(&repository.full_name),
         short_sha = escape_html(detail.summary.short_sha()),
-        generated = Local::now().format("%Y-%m-%d %H:%M %Z"),
+        generated = generated,
         title = escape_html(&detail.summary.title),
         author = escape_html(&detail.summary.author_name),
         sha = escape_html(&detail.summary.sha),
@@ -180,6 +186,27 @@ pub fn export_commit(repository: &Repository, detail: &CommitDetail) -> Result<P
         &body,
     )?;
     Ok(output)
+}
+
+fn export_output_path(stem: &str, timestamp: &str) -> Result<PathBuf> {
+    let export_dir = std::env::current_dir()?.join("exports");
+    fs::create_dir_all(&export_dir).with_context(|| {
+        format!(
+            "Could not create export directory: {}",
+            export_dir.display()
+        )
+    })?;
+
+    let base = format!("{timestamp}-{stem}");
+    let mut candidate = export_dir.join(format!("{base}.html"));
+    let mut suffix = 2usize;
+
+    while candidate.exists() {
+        candidate = export_dir.join(format!("{base}-{suffix}.html"));
+        suffix += 1;
+    }
+
+    Ok(candidate)
 }
 
 fn write_document(path: &Path, title: &str, body: &str) -> Result<()> {

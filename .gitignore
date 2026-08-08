@@ -8,3 +8,6 @@ repotrek-*.html
 # Local patch files
 *.patch
 *.diff
+
+# RepoTrek print exports
+/exports/
