@@ -1,4 +1,11 @@
 [package]
+
+exclude = [
+    "exports/**",
+    "*.patch",
+    "*.diff",
+]
+homepage = "https://github.com/yuna-r/repotrek"
 name = "repotrek"
 version = "0.3.6"
 edition = "2024"
