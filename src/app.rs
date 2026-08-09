@@ -61,16 +61,18 @@ pub enum RepositoryTab {
     Issues,
     Actions,
     Releases,
+    Intelligence,
 }
 
 impl RepositoryTab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Code,
         Self::Commits,
         Self::PullRequests,
         Self::Issues,
         Self::Actions,
         Self::Releases,
+        Self::Intelligence,
     ];
 
     #[must_use]
@@ -82,6 +84,7 @@ impl RepositoryTab {
             Self::Issues => 3,
             Self::Actions => 4,
             Self::Releases => 5,
+            Self::Intelligence => 6,
         }
     }
 
@@ -180,6 +183,7 @@ impl RepositoryState {
             RepositoryTab::Issues => self.issues.len(),
             RepositoryTab::Actions => self.workflow_runs.len(),
             RepositoryTab::Releases => self.releases.len(),
+            RepositoryTab::Intelligence => 0,
         }
     }
 }
@@ -1738,6 +1742,7 @@ impl App {
             KeyCode::Char('4') => self.select_repository_tab(RepositoryTab::Issues),
             KeyCode::Char('5') => self.select_repository_tab(RepositoryTab::Actions),
             KeyCode::Char('6') => self.select_repository_tab(RepositoryTab::Releases),
+            KeyCode::Char('7') | KeyCode::Char('I') => self.select_repository_tab(RepositoryTab::Intelligence),
             KeyCode::Left | KeyCode::Char('h') => {
                 let tab = repository.tab.previous();
                 self.select_repository_tab(tab)
@@ -1806,6 +1811,7 @@ impl App {
             RepositoryTab::Issues => !repository.issues.is_empty(),
             RepositoryTab::Actions => !repository.workflow_runs.is_empty(),
             RepositoryTab::Releases => !repository.releases.is_empty(),
+            RepositoryTab::Intelligence => true,
         };
         if loaded {
             AppCommand::None
@@ -2342,6 +2348,7 @@ fn enter_repository_selection(repository: &RepositoryState) -> AppCommand {
             .releases
             .get(repository.list_index)
             .map_or(AppCommand::None, |item| AppCommand::OpenRelease(item.id)),
+        RepositoryTab::Intelligence => AppCommand::None,
     }
 }
 
@@ -2367,6 +2374,7 @@ fn selected_external_url(repository: &RepositoryState) -> Option<String> {
             .releases
             .get(repository.list_index)
             .map(|item| item.html_url.clone()),
+        RepositoryTab::Intelligence => Some(repository.repository.html_url.clone()),
     }
 }
 
@@ -2383,7 +2391,8 @@ fn move_repository_selection(repository: &mut RepositoryState, delta: isize) {
         RepositoryTab::PullRequests
         | RepositoryTab::Issues
         | RepositoryTab::Actions
-        | RepositoryTab::Releases => {
+        | RepositoryTab::Releases
+        | RepositoryTab::Intelligence => {
             let len = repository.active_list_len();
             move_index(&mut repository.list_index, len, delta);
         }
@@ -2401,7 +2410,8 @@ fn set_repository_selection(repository: &mut RepositoryState, value: usize) {
         RepositoryTab::PullRequests
         | RepositoryTab::Issues
         | RepositoryTab::Actions
-        | RepositoryTab::Releases => {
+        | RepositoryTab::Releases
+        | RepositoryTab::Intelligence => {
             repository.list_index = value.min(repository.active_list_len().saturating_sub(1));
         }
     }

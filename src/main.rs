@@ -6,6 +6,7 @@ mod diff;
 mod export;
 mod highlight;
 mod icons;
+mod intelligence;
 mod model;
 mod provider;
 mod settings;
@@ -42,6 +43,84 @@ use crate::{
 fn main() -> Result<()> {
     install_panic_hook();
     let cli = Cli::parse();
+
+    if let Some(cmd) = cli.command {
+        let engine = intelligence::IntelligenceEngine::new();
+        let current_dir = std::env::current_dir()?;
+        let (index, findings, health) = engine.analyze_local(&current_dir)?;
+
+        let format = if cli.json {
+            intelligence::ReportFormat::Json
+        } else if cli.sarif {
+            intelligence::ReportFormat::Sarif
+        } else if cli.markdown {
+            intelligence::ReportFormat::Markdown
+        } else if cli.html {
+            intelligence::ReportFormat::Html
+        } else {
+            intelligence::ReportFormat::Json
+        };
+
+        match cmd {
+            cli::Commands::Intelligence { .. } | cli::Commands::Health { .. } => {
+                if cli.json || cli.sarif || cli.markdown || cli.html {
+                    println!("{}", intelligence::format_report(format, &index, &findings));
+                } else {
+                    println!("====================================================");
+                    println!("REPO TREK INTELLIGENCE ANALYSIS");
+                    println!("====================================================");
+                    println!("Repository: {}", index.repo_name);
+                    println!("Overall Health Score: {}/100 ({})", health.overall, health.status);
+                    println!("\nCATEGORY BREAKDOWN:");
+                    for c in &health.categories {
+                        println!("  - {:<15}: {}/100 ({})", c.name, c.score, c.status);
+                    }
+                    println!("\nFINDINGS SUMMARY:");
+                    println!("  Total Findings: {}", findings.len());
+                    println!("  Critical: {}", health.critical_count);
+                    println!("  High: {}", health.high_count);
+                    println!("====================================================");
+                }
+            }
+            cli::Commands::Architecture { .. } => {
+                let arch_findings: Vec<_> = findings.iter().filter(|f| f.analyzer == "ArchitectureAnalyzer").collect();
+                println!("{}", serde_json::to_string_pretty(&arch_findings)?);
+            }
+            cli::Commands::Dependencies { .. } => {
+                let dep_findings: Vec<_> = findings.iter().filter(|f| f.analyzer == "DependencyAnalyzer").collect();
+                println!("{}", serde_json::to_string_pretty(&dep_findings)?);
+            }
+            cli::Commands::Security { .. } => {
+                let sec_findings: Vec<_> = findings.iter().filter(|f| f.analyzer == "SecurityAnalyzer" || f.analyzer == "VulnerabilityAnalyzer").collect();
+                println!("{}", serde_json::to_string_pretty(&sec_findings)?);
+            }
+            cli::Commands::Quality { .. } => {
+                let qual_findings: Vec<_> = findings.iter().filter(|f| f.analyzer == "QualityAnalyzer").collect();
+                println!("{}", serde_json::to_string_pretty(&qual_findings)?);
+            }
+            cli::Commands::Onboard { .. } => {
+                let guide = intelligence::analyzers::onboarding::OnboardingAnalyzer::generate_guide(&index);
+                println!("{}", serde_json::to_string_pretty(&guide)?);
+            }
+            cli::Commands::Report { .. } => {
+                if cli.json || cli.sarif || cli.markdown || cli.html {
+                    println!("{}", intelligence::format_report(format, &index, &findings));
+                } else {
+                    println!("{}", intelligence::RepositoryReport::generate(&index, &findings));
+                }
+            }
+            cli::Commands::Ai { query } => {
+                let gateway = intelligence::AiGateway::new(intelligence::PrivacyMode::Default);
+                let response = gateway.ask(&index, &findings, &query)?;
+                println!("{}", response);
+            }
+            cli::Commands::Mcp => {
+                let server = intelligence::McpServer::new(index, findings);
+                server.run_stdio()?;
+            }
+        }
+        return Ok(());
+    }
 
     let settings_store = SettingsStore::load()?;
     let mut settings = settings_store.settings().clone();
@@ -569,6 +648,7 @@ fn load_repository_tab(
                 app.set_releases(values);
             }
         }
+        RepositoryTab::Intelligence => {}
     }
     Ok(())
 }
