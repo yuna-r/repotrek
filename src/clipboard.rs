@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow};
 pub fn copy_text(text: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return pipe_to("pbcopy", &[], text);
+        pipe_to("pbcopy", &[], text)
     }
     #[cfg(target_os = "windows")]
     {
@@ -43,7 +43,7 @@ pub fn copy_text(text: &str) -> Result<()> {
 pub fn paste_text() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
-        return read_from("pbpaste", &[]);
+        read_from("pbpaste", &[])
     }
     #[cfg(target_os = "windows")]
     {

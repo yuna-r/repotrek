@@ -1531,12 +1531,12 @@ impl App {
                     AppCommand::None
                 }
                 KeyCode::Enter => {
-                    if let Some(symbol) = results.get(index) {
-                        if let Some(file) = self.file.as_mut() {
-                            file.cursor_line = symbol.line.saturating_sub(1);
-                            file.viewport_top = file.cursor_line.saturating_sub(4);
-                            file.tab = FileTab::Code;
-                        }
+                    if let Some(symbol) = results.get(index)
+                        && let Some(file) = self.file.as_mut()
+                    {
+                        file.cursor_line = symbol.line.saturating_sub(1);
+                        file.viewport_top = file.cursor_line.saturating_sub(4);
+                        file.tab = FileTab::Code;
                     }
                     AppCommand::None
                 }
@@ -1835,20 +1835,19 @@ impl App {
             return AppCommand::None;
         };
 
-        if file.tab != FileTab::History {
-            if let Some(delta) = selection_delta(key) {
-                if file.selection_anchor.is_none() {
-                    file.selection_anchor = Some(file.cursor_line);
-                }
-                if delta < 0 {
-                    file.cursor_line = file.cursor_line.saturating_sub(1);
-                } else {
-                    file.cursor_line =
-                        (file.cursor_line + 1).min(file.line_count().saturating_sub(1));
-                }
-                keep_cursor_visible(file);
-                return AppCommand::None;
+        if file.tab != FileTab::History
+            && let Some(delta) = selection_delta(key)
+        {
+            if file.selection_anchor.is_none() {
+                file.selection_anchor = Some(file.cursor_line);
             }
+            if delta < 0 {
+                file.cursor_line = file.cursor_line.saturating_sub(1);
+            } else {
+                file.cursor_line = (file.cursor_line + 1).min(file.line_count().saturating_sub(1));
+            }
+            keep_cursor_visible(file);
+            return AppCommand::None;
         }
 
         match key.code {

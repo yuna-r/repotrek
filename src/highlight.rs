@@ -190,7 +190,8 @@ fn tokenize_json(line: &str, theme: Theme) -> Vec<Span<'static>> {
 }
 
 fn tokenize_config(line: &str, language: Language, theme: Theme) -> Vec<Span<'static>> {
-    let marker = if language == Language::Yaml { "#" } else { "#" };
+    let _ = &language;
+    let marker = "#";
     let comment_index = find_comment(line, marker);
     let (code, comment) =
         comment_index.map_or((line, None), |index| (&line[..index], Some(&line[index..])));

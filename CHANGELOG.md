@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.9
+
+- Fixed strict Clippy checks used by the crates.io publishing workflow.
+- Scoped macOS Keychain constants to macOS builds.
+- Cleaned up Clippy-reported control flow and highlighting code.
+
+
 ## 0.3.5
 
 - Made `Shift+A` the official select-all shortcut for readers.

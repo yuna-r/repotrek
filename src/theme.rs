@@ -40,6 +40,7 @@ impl ThemeMode {
 pub struct Theme {
     pub background: Color,
     pub surface: Color,
+    #[allow(dead_code)]
     pub surface_alt: Color,
     pub text: Color,
     pub muted: Color,
@@ -54,6 +55,7 @@ pub struct Theme {
     pub diff_add_bg: Color,
     pub diff_delete_bg: Color,
     pub diff_hunk_bg: Color,
+    #[allow(dead_code)]
     pub link: Color,
     pub keyword: Color,
     pub type_name: Color,

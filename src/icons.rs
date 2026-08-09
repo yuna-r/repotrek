@@ -32,9 +32,11 @@ pub struct Icons {
     pub branch: &'static str,
     pub commit: &'static str,
     pub verified: &'static str,
+    #[allow(dead_code)]
     pub warning: &'static str,
     pub star: &'static str,
     pub fork: &'static str,
+    #[allow(dead_code)]
     pub print: &'static str,
 }
 

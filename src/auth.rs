@@ -6,7 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.repotrek.github-token";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_ACCOUNT: &str = "repotrek";
 
 #[must_use]
@@ -67,14 +69,14 @@ pub fn save_token_persistently(token: &str) -> Result<String> {
     #[cfg(target_os = "macos")]
     {
         match save_token_to_macos_keychain(token) {
-            Ok(()) => return Ok("macOS Keychain".to_owned()),
+            Ok(()) => Ok("macOS Keychain".to_owned()),
             Err(keychain_error) => {
                 if let Some(cli_error) = github_cli_error {
                     return Err(anyhow!(
                         "GitHub CLI and macOS Keychain both rejected the token: {cli_error}; {keychain_error}"
                     ));
                 }
-                return Err(keychain_error);
+                Err(keychain_error)
             }
         }
     }
