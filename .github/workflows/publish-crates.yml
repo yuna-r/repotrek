@@ -1,0 +1,75 @@
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish crate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Verify tag matches Cargo.toml
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          CARGO_VERSION="$(
+            cargo metadata \
+              --no-deps \
+              --format-version 1 |
+            python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+print(data["packages"][0]["version"])
+'
+          )"
+
+          echo "Tag version:   ${TAG_VERSION}"
+          echo "Cargo version: ${CARGO_VERSION}"
+
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Git tag and Cargo.toml versions do not match"
+            exit 1
+          fi
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets --all-features
+
+      - name: Show packaged files
+        run: cargo package --list
+
+      - name: Publish dry run
+        run: cargo publish --dry-run --locked
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked
