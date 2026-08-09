@@ -4,17 +4,21 @@ use chrono::{DateTime, Utc};
 use reqwest::{
     StatusCode, Url,
     blocking::{Client, RequestBuilder, Response},
-    header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
+    header::{
+        ACCEPT, AUTHORIZATION, ETAG, HeaderMap, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH,
+        LAST_MODIFIED, RETRY_AFTER,
+    },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
+    cache::{CacheStore, CacheSummary},
     model::{
         ApiResponse, BlameRange, BranchSummary, CodeSearchResult, Comment, CommitDetail,
         CommitFile, CommitStats, CommitSummary, ContentEntry, ContentKind, IssueDetail,
-        IssueSummary, PullRequestDetail, PullRequestSummary, RateLimit, ReleaseAsset,
-        ReleaseDetail, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry, WorkflowJob,
-        WorkflowRunDetail, WorkflowRunSummary, WorkflowStep,
+        IssueSummary, OpenClosedFilter, PullRequestDetail, PullRequestSummary, RateLimit,
+        ReleaseAsset, ReleaseDetail, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry,
+        WorkflowJob, WorkflowRunDetail, WorkflowRunSummary, WorkflowStep,
     },
     provider::{ProviderError, ProviderResult, RepositoryProvider},
 };
@@ -30,6 +34,7 @@ const MAX_TEXT_FILE_BYTES: usize = 4 * 1024 * 1024;
 pub struct GitHubProvider {
     client: Client,
     token: Option<String>,
+    cache: CacheStore,
 }
 
 impl GitHubProvider {
@@ -43,7 +48,11 @@ impl GitHubProvider {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(40))
             .build()?;
-        Ok(Self { client, token })
+        Ok(Self {
+            client,
+            token,
+            cache: CacheStore::new(),
+        })
     }
 
     pub fn set_token(&mut self, token: String) {
@@ -57,6 +66,31 @@ impl GitHubProvider {
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         self.token.is_some()
+    }
+
+    pub fn set_force_refresh(&self, enabled: bool) {
+        self.cache.set_force_refresh(enabled);
+    }
+
+    #[must_use]
+    pub fn cache_status_line(&self) -> Option<String> {
+        self.cache.last_event().map(|event| event.display_line())
+    }
+
+    #[must_use]
+    pub fn cache_summary(&self) -> CacheSummary {
+        self.cache.summary()
+    }
+
+    pub fn clear_cache(&self) -> std::io::Result<CacheSummary> {
+        self.cache.clear()
+    }
+
+    fn cache_variant(&self, accept: &str) -> String {
+        self.token.as_ref().map_or_else(
+            || format!("{accept};scope=anonymous"),
+            |token| format!("{accept};scope=auth-{:016x}", token_fingerprint(token)),
+        )
     }
 
     fn request(&self, request: RequestBuilder, accept: &'static str) -> RequestBuilder {
@@ -77,6 +111,16 @@ impl GitHubProvider {
     where
         T: DeserializeOwned,
     {
+        let (bytes, rate_limit) = self.send_cached_bytes(request, JSON_ACCEPT, None)?;
+        let value = serde_json::from_slice::<T>(&bytes)
+            .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
+        Ok(ApiResponse { value, rate_limit })
+    }
+
+    fn send_json_uncached<T>(&self, request: RequestBuilder) -> ProviderResult<T>
+    where
+        T: DeserializeOwned,
+    {
         let response = self.request(request, JSON_ACCEPT).send()?;
         let rate_limit = parse_rate_limit(response.headers());
         let response = ensure_success(response, rate_limit.clone())?;
@@ -84,6 +128,113 @@ impl GitHubProvider {
             .json::<T>()
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
         Ok(ApiResponse { value, rate_limit })
+    }
+
+    fn send_cached_bytes(
+        &self,
+        request: RequestBuilder,
+        accept: &'static str,
+        max_bytes: Option<usize>,
+    ) -> Result<(Vec<u8>, RateLimit), ProviderError> {
+        let mut request = self.request(request, accept);
+        let request_url = request
+            .try_clone()
+            .and_then(|clone| clone.build().ok())
+            .map(|request| request.url().to_string());
+        let variant = self.cache_variant(accept);
+        let cached = request_url
+            .as_deref()
+            .and_then(|url| self.cache.load(url, &variant));
+
+        if let Some(limit) = max_bytes
+            && let Some(entry) = cached.as_ref()
+            && entry.body_len() > limit
+        {
+            return Err(ProviderError::FileTooLarge {
+                size: entry.body_len(),
+                limit,
+            });
+        }
+
+        if let Some(entry) = cached.as_ref()
+            && self.cache.is_fresh(entry)
+        {
+            let entry = self.cache.record_hit(entry.clone());
+            let rate_limit = entry.rate_limit();
+            return Ok((entry.into_body(), rate_limit));
+        }
+
+        if let Some(entry) = cached.as_ref() {
+            if let Some(etag) = entry.etag() {
+                request = request.header(IF_NONE_MATCH, etag);
+            }
+            if let Some(last_modified) = entry.last_modified() {
+                request = request.header(IF_MODIFIED_SINCE, last_modified);
+            }
+        }
+
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(entry) = cached {
+                    let entry = self.cache.record_stale_fallback(entry);
+                    let rate_limit = entry.rate_limit();
+                    return Ok((entry.into_body(), rate_limit));
+                }
+                return Err(error.into());
+            }
+        };
+        let rate_limit = parse_rate_limit(response.headers());
+
+        if response.status().is_server_error()
+            && let Some(entry) = cached.as_ref()
+        {
+            let entry = self.cache.record_stale_fallback(entry.clone());
+            let cached_rate_limit = entry.rate_limit();
+            return Ok((entry.into_body(), cached_rate_limit));
+        }
+
+        if response.status() == StatusCode::NOT_MODIFIED {
+            let Some(entry) = cached else {
+                return Err(ProviderError::InvalidResponse(
+                    "GitHub returned 304 without a local cache entry".to_owned(),
+                ));
+            };
+            let effective_rate_limit = if rate_limit_present(&rate_limit) {
+                rate_limit
+            } else {
+                entry.rate_limit()
+            };
+            let entry = self.cache.revalidated(entry, &effective_rate_limit);
+            return Ok((entry.into_body(), effective_rate_limit));
+        }
+
+        let response = ensure_success(response, rate_limit.clone())?;
+        let etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let last_modified = response
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response.bytes()?.to_vec();
+        if let Some(limit) = max_bytes
+            && bytes.len() > limit
+        {
+            return Err(ProviderError::FileTooLarge {
+                size: bytes.len(),
+                limit,
+            });
+        }
+        if let Some(url) = request_url.as_deref() {
+            let _ = self
+                .cache
+                .store(url, &variant, &bytes, etag, last_modified, &rate_limit);
+        }
+        Ok((bytes, rate_limit))
     }
 
     /// Retry a public GitHub REST request once without Authorization when a
@@ -125,17 +276,9 @@ impl GitHubProvider {
     }
 
     fn send_text(&self, request: RequestBuilder) -> ProviderResult<String> {
-        let response = self.request(request, RAW_ACCEPT).send()?;
-        let rate_limit = parse_rate_limit(response.headers());
-        let response = ensure_success(response, rate_limit.clone())?;
-        let bytes = response.bytes()?;
-        if bytes.len() > MAX_TEXT_FILE_BYTES {
-            return Err(ProviderError::FileTooLarge {
-                size: bytes.len(),
-                limit: MAX_TEXT_FILE_BYTES,
-            });
-        }
-        let value = String::from_utf8(bytes.to_vec()).map_err(|_| ProviderError::BinaryFile)?;
+        let (bytes, rate_limit) =
+            self.send_cached_bytes(request, RAW_ACCEPT, Some(MAX_TEXT_FILE_BYTES))?;
+        let value = String::from_utf8(bytes).map_err(|_| ProviderError::BinaryFile)?;
         Ok(ApiResponse { value, rate_limit })
     }
 
@@ -424,6 +567,14 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
         query: &str,
         per_page: u32,
     ) -> ProviderResult<Vec<CodeSearchResult>> {
+        if self.token.is_none() {
+            return Err(ProviderError::AuthenticationRequired {
+                rate_limit: RateLimit {
+                    resource: Some("search".to_owned()),
+                    ..RateLimit::default()
+                },
+            });
+        }
         let url = Url::parse("https://api.github.com/search/code")
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
         let q = format!("{query} repo:{}", id.full_name());
@@ -444,13 +595,18 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
         })
     }
 
-    fn pull_requests(&self, id: &RepositoryId) -> ProviderResult<Vec<PullRequestSummary>> {
+    fn pull_requests(
+        &self,
+        id: &RepositoryId,
+        state: OpenClosedFilter,
+    ) -> ProviderResult<Vec<PullRequestSummary>> {
         let url = self.repo_url(id, &["pulls"])?;
         let result: ProviderResult<Vec<PullRequestDto>> =
             self.send_json_public_fallback(self.client.get(url).query(&[
-                ("state", "open"),
+                ("state", state.api_value()),
                 ("sort", "updated"),
-                ("per_page", "50"),
+                ("direction", "desc"),
+                ("per_page", "100"),
             ]));
 
         match result {
@@ -522,7 +678,7 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
             value: PullRequestDetail {
                 summary,
                 state: detail.state.unwrap_or_else(|| "unknown".to_owned()),
-                merged: detail.merged.unwrap_or(false),
+                merged: detail.merged.unwrap_or(false) || detail.merged_at.is_some(),
                 body: detail.body.unwrap_or_default(),
                 commits: detail.commits.unwrap_or(0),
                 changed_files: detail.changed_files.unwrap_or(0),
@@ -535,13 +691,18 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
         })
     }
 
-    fn issues(&self, id: &RepositoryId) -> ProviderResult<Vec<IssueSummary>> {
+    fn issues(
+        &self,
+        id: &RepositoryId,
+        state: OpenClosedFilter,
+    ) -> ProviderResult<Vec<IssueSummary>> {
         let url = self.repo_url(id, &["issues"])?;
         let response: ApiResponse<Vec<IssueDto>> =
             self.send_json(self.client.get(url).query(&[
-                ("state", "open"),
+                ("state", state.api_value()),
                 ("sort", "updated"),
-                ("per_page", "50"),
+                ("direction", "desc"),
+                ("per_page", "100"),
             ]))?;
         Ok(ApiResponse {
             value: response
@@ -679,12 +840,28 @@ query RepoTrekBlame($owner: String!, $name: String!, $expression: String!, $path
     fn viewer_login(&self) -> ProviderResult<String> {
         let url = Url::parse("https://api.github.com/user")
             .map_err(|error| ProviderError::InvalidResponse(error.to_string()))?;
-        let response: ApiResponse<ViewerDto> = self.send_json(self.client.get(url))?;
+        let response: ApiResponse<ViewerDto> = self.send_json_uncached(self.client.get(url))?;
         Ok(ApiResponse {
             value: response.value.login,
             rate_limit: response.rate_limit,
         })
     }
+}
+
+fn token_fingerprint(token: &str) -> u64 {
+    token
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+fn rate_limit_present(rate_limit: &RateLimit) -> bool {
+    rate_limit.limit.is_some()
+        || rate_limit.remaining.is_some()
+        || rate_limit.reset_epoch.is_some()
+        || rate_limit.resource.is_some()
 }
 
 fn ensure_success(response: Response, rate_limit: RateLimit) -> Result<Response, ProviderError> {
@@ -1090,6 +1267,9 @@ impl SearchCodeItemDto {
             path: self.path,
             sha: self.sha,
             html_url: self.html_url,
+            line: None,
+            preview: None,
+            kind: None,
         }
     }
 }
@@ -1107,6 +1287,7 @@ struct PullRequestDto {
     html_url: String,
     state: Option<String>,
     merged: Option<bool>,
+    merged_at: Option<DateTime<Utc>>,
     body: Option<String>,
     commits: Option<u64>,
     changed_files: Option<u64>,
@@ -1132,6 +1313,8 @@ impl PullRequestDto {
             comments: self.comments.unwrap_or(0),
             updated_at: self.updated_at,
             html_url: self.html_url,
+            state: self.state.unwrap_or_else(|| "open".to_owned()),
+            merged: self.merged.unwrap_or(false) || self.merged_at.is_some(),
         }
     }
 }
@@ -1165,6 +1348,7 @@ impl IssueDto {
             labels: self.labels.into_iter().map(|label| label.name).collect(),
             updated_at: self.updated_at,
             html_url: self.html_url,
+            state: self.state.unwrap_or_else(|| "open".to_owned()),
         }
     }
 }
@@ -1414,7 +1598,7 @@ struct BlameActorDto {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitDetailDto, ContentDto, RepositoryDto};
+    use super::{CommitDetailDto, ContentDto, IssueDto, PullRequestDto, RepositoryDto};
 
     #[test]
     fn parses_repository_response() {
@@ -1482,5 +1666,46 @@ mod tests {
         assert!(detail.summary.verified);
         assert_eq!(detail.files.len(), 1);
         assert_eq!(detail.stats.total, 12);
+    }
+
+    #[test]
+    fn parses_closed_merged_pull_request_summary() {
+        let value = serde_json::json!({
+            "number": 42,
+            "title": "Add cancellable search",
+            "user": { "login": "contributor" },
+            "head": { "ref": "feature/cancel" },
+            "base": { "ref": "main" },
+            "draft": false,
+            "comments": 3,
+            "updated_at": "2026-08-09T00:00:00Z",
+            "html_url": "https://github.com/yuna-r/repotrek/pull/42",
+            "state": "closed",
+            "merged_at": "2026-08-09T01:00:00Z"
+        });
+        let summary = serde_json::from_value::<PullRequestDto>(value)
+            .expect("valid pull request response")
+            .into_summary();
+        assert_eq!(summary.state, "closed");
+        assert!(summary.merged);
+    }
+
+    #[test]
+    fn parses_closed_issue_summary() {
+        let value = serde_json::json!({
+            "number": 7,
+            "title": "Document state filters",
+            "user": { "login": "reporter" },
+            "comments": 1,
+            "labels": [{ "name": "documentation" }],
+            "updated_at": "2026-08-09T00:00:00Z",
+            "html_url": "https://github.com/yuna-r/repotrek/issues/7",
+            "state": "closed"
+        });
+        let summary = serde_json::from_value::<IssueDto>(value)
+            .expect("valid issue response")
+            .into_summary();
+        assert_eq!(summary.state, "closed");
+        assert_eq!(summary.labels, vec!["documentation".to_owned()]);
     }
 }

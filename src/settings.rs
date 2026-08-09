@@ -9,12 +9,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::ThemeMode;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FooterMode {
+    #[default]
+    Compact,
+    Full,
+}
+
+impl FooterMode {
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Compact => Self::Full,
+            Self::Full => Self::Compact,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Full => "Full",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeMode,
     pub wrap_code: bool,
     pub wrap_diff: bool,
+    pub footer_mode: FooterMode,
 }
 
 impl Default for Settings {
@@ -23,6 +50,7 @@ impl Default for Settings {
             theme: ThemeMode::Dark,
             wrap_code: false,
             wrap_diff: false,
+            footer_mode: FooterMode::Compact,
         }
     }
 }
@@ -113,7 +141,7 @@ fn temporary_path(path: &Path) -> PathBuf {
 mod tests {
     use std::{fs, time::SystemTime};
 
-    use super::{Settings, SettingsStore};
+    use super::{FooterMode, Settings, SettingsStore};
     use crate::theme::ThemeMode;
 
     #[test]
@@ -129,12 +157,14 @@ mod tests {
                 theme: ThemeMode::Light,
                 wrap_code: true,
                 wrap_diff: true,
+                footer_mode: FooterMode::Full,
             })
             .expect("save settings");
         let loaded = SettingsStore::from_path(path.clone()).expect("reload settings");
         assert_eq!(loaded.settings().theme, ThemeMode::Light);
         assert!(loaded.settings().wrap_code);
         assert!(loaded.settings().wrap_diff);
+        assert_eq!(loaded.settings().footer_mode, FooterMode::Full);
         let _ = fs::remove_file(path);
     }
 }

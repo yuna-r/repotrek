@@ -8,7 +8,8 @@ use chrono::Local;
 
 use crate::{
     diff::{DiffKind, parse_patch},
-    highlight::source_html,
+    highlight::{source_html, source_html_with_language},
+    language::detect_language,
     model::{CommitDetail, Repository},
 };
 
@@ -27,6 +28,7 @@ pub fn export_file(
         sanitize_filename(path)
     );
     let output = export_output_path(&stem, &timestamp)?;
+    let language = detect_language(path, content);
     let rows = content
         .lines()
         .enumerate()
@@ -34,7 +36,7 @@ pub fn export_file(
             format!(
                 "<tr><td class=\"ln\">{}</td><td class=\"code\"><code>{}</code></td></tr>",
                 index + 1,
-                source_html(line, path)
+                source_html_with_language(line, language)
             )
         })
         .collect::<Vec<_>>()

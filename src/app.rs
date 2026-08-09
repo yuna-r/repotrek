@@ -5,11 +5,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
     diff::{DiffKind, parse_patch},
     icons::Icons,
+    language::detect_language,
     model::{
         BlameRange, BranchSummary, CodeSearchResult, Comment, CommitDetail, CommitSummary,
         ContentEntry, ContentKind, HistoryEntry, HistoryScreen, IssueDetail, IssueSummary,
-        PullRequestDetail, PullRequestSummary, RateLimit, ReleaseDetail, ReleaseSummary, RepoCard,
-        Repository, RepositoryId, SymbolLocation, TreeEntry, WorkflowRunDetail, WorkflowRunSummary,
+        OpenClosedFilter, PullRequestDetail, PullRequestSummary, RateLimit, ReleaseDetail,
+        ReleaseSummary, RepoCard, Repository, RepositoryId, SymbolLocation, TreeEntry,
+        WorkflowRunDetail, WorkflowRunSummary,
     },
     settings::Settings,
     symbols,
@@ -145,7 +147,11 @@ pub struct RepositoryState {
     pub commit_index: usize,
     pub commit_page: u32,
     pub pull_requests: Vec<PullRequestSummary>,
+    pub pull_request_filter: OpenClosedFilter,
+    pub pull_requests_loaded: bool,
     pub issues: Vec<IssueSummary>,
+    pub issue_filter: OpenClosedFilter,
+    pub issues_loaded: bool,
     pub workflow_runs: Vec<WorkflowRunSummary>,
     pub releases: Vec<ReleaseSummary>,
     pub list_index: usize,
@@ -198,6 +204,9 @@ pub struct FileState {
     pub history_index: usize,
     pub history_loaded: bool,
     pub blame_loaded: bool,
+    pub last_find: Option<String>,
+    pub find_matches: Vec<usize>,
+    pub find_index: usize,
 }
 
 impl FileState {
@@ -332,6 +341,12 @@ pub enum CodeSearchMode {
 pub enum Modal {
     Help,
     ConfirmClearHistory,
+    CacheManager {
+        lines: Vec<String>,
+    },
+    ConfirmClearCache {
+        lines: Vec<String>,
+    },
     Settings {
         index: usize,
     },
@@ -377,12 +392,20 @@ pub enum Modal {
         results: Vec<SymbolLocation>,
         index: usize,
     },
+    FindInFile {
+        query: String,
+        matches: Vec<usize>,
+        index: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     None,
     Quit,
+    ForceRefresh(Box<AppCommand>),
+    ShowCacheManager,
+    ClearCache,
     OpenRepository {
         id: RepositoryId,
         resume_path: Option<String>,
@@ -396,6 +419,8 @@ pub enum AppCommand {
     OpenFile {
         path: String,
         find: Option<String>,
+        line: Option<usize>,
+        definition: bool,
     },
     LoadRepositoryTab(RepositoryTab),
     LoadCommits {
@@ -445,6 +470,7 @@ pub struct App {
     pub modal: Option<Modal>,
     pub loading: Option<String>,
     status: Option<StatusMessage>,
+    cache_status: Option<String>,
     pub rate_limit: Option<RateLimit>,
     pub icons: Icons,
     pub settings: Settings,
@@ -480,6 +506,7 @@ impl App {
             modal: None,
             loading: None,
             status: None,
+            cache_status: None,
             rate_limit: None,
             icons,
             settings,
@@ -497,6 +524,14 @@ impl App {
     pub fn toggle_theme(&mut self) {
         self.settings.theme = self.settings.theme.toggled();
         self.set_status(format!("Theme: {}", self.settings.theme.label()));
+    }
+
+    pub fn toggle_footer_mode(&mut self) {
+        self.settings.footer_mode = self.settings.footer_mode.toggled();
+        self.set_status(format!(
+            "Footer key hints: {}",
+            self.settings.footer_mode.label()
+        ));
     }
 
     pub fn toggle_context_wrap(&mut self) {
@@ -567,6 +602,19 @@ impl App {
         self.status.as_ref().map(|status| status.text.as_str())
     }
 
+    pub fn set_cache_status(&mut self, text: Option<String>) {
+        self.cache_status = text;
+    }
+
+    #[must_use]
+    pub fn cache_status_text(&self) -> Option<&str> {
+        self.cache_status.as_deref()
+    }
+
+    pub fn show_cache_manager(&mut self, lines: Vec<String>) {
+        self.modal = Some(Modal::CacheManager { lines });
+    }
+
     pub fn show_error(&mut self, title: impl Into<String>, message: impl Into<String>) {
         self.modal = Some(Modal::Error {
             title: title.into(),
@@ -604,7 +652,11 @@ impl App {
             commit_index: 0,
             commit_page: 1,
             pull_requests: Vec::new(),
+            pull_request_filter: OpenClosedFilter::Open,
+            pull_requests_loaded: false,
             issues: Vec::new(),
+            issue_filter: OpenClosedFilter::Open,
+            issues_loaded: false,
             workflow_runs: Vec::new(),
             releases: Vec::new(),
             list_index: 0,
@@ -638,7 +690,9 @@ impl App {
             repository.tab = RepositoryTab::Code;
             repository.commits.clear();
             repository.pull_requests.clear();
+            repository.pull_requests_loaded = false;
             repository.issues.clear();
+            repository.issues_loaded = false;
             repository.workflow_runs.clear();
             repository.releases.clear();
             repository.tree_cache = None;
@@ -650,15 +704,31 @@ impl App {
         self.screen = Screen::Repository;
     }
 
-    pub fn open_file(&mut self, path: String, content: String, find: Option<&str>) {
-        let mut cursor_line = 0;
-        if let Some(needle) = find.filter(|needle| !needle.trim().is_empty()) {
-            let needle = needle.to_ascii_lowercase();
-            cursor_line = content
-                .lines()
-                .position(|line| line.to_ascii_lowercase().contains(&needle))
-                .unwrap_or(0);
-        }
+    pub fn open_file(
+        &mut self,
+        path: String,
+        content: String,
+        find: Option<&str>,
+        line: Option<usize>,
+    ) {
+        let find_query = find
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_owned);
+        let find_matches = find_query
+            .as_deref()
+            .map(|query| find_lines(&content, query))
+            .unwrap_or_default();
+        let explicit_line = line
+            .and_then(|line| line.checked_sub(1))
+            .map(|line| line.min(content.lines().count().saturating_sub(1)));
+        let cursor_line = explicit_line
+            .or_else(|| find_matches.first().copied())
+            .unwrap_or(0);
+        let find_index = find_matches
+            .iter()
+            .position(|matched_line| *matched_line == cursor_line)
+            .unwrap_or(0);
         self.file = Some(FileState {
             path,
             content,
@@ -672,6 +742,9 @@ impl App {
             history_index: 0,
             history_loaded: false,
             blame_loaded: false,
+            last_find: find_query,
+            find_matches,
+            find_index,
         });
         self.screen = Screen::File;
     }
@@ -686,18 +759,22 @@ impl App {
         self.screen = Screen::Repository;
     }
 
-    pub fn set_pull_requests(&mut self, values: Vec<PullRequestSummary>) {
+    pub fn set_pull_requests(&mut self, filter: OpenClosedFilter, values: Vec<PullRequestSummary>) {
         if let Some(repository) = self.repository.as_mut() {
             repository.tab = RepositoryTab::PullRequests;
+            repository.pull_request_filter = filter;
             repository.pull_requests = values;
+            repository.pull_requests_loaded = true;
             repository.list_index = 0;
         }
     }
 
-    pub fn set_issues(&mut self, values: Vec<IssueSummary>) {
+    pub fn set_issues(&mut self, filter: OpenClosedFilter, values: Vec<IssueSummary>) {
         if let Some(repository) = self.repository.as_mut() {
             repository.tab = RepositoryTab::Issues;
+            repository.issue_filter = filter;
             repository.issues = values;
+            repository.issues_loaded = true;
             repository.list_index = 0;
         }
     }
@@ -808,6 +885,11 @@ impl App {
 
     pub fn set_repository_search_results(&mut self, query: String, mut results: Vec<RepoCard>) {
         rank_repository_results(&query, &mut results);
+        if results.is_empty() {
+            self.set_status(format!("No repositories matched \"{query}\""));
+        } else {
+            self.set_status(format!("{} repository matches", results.len()));
+        }
         self.modal = Some(Modal::RepositorySearch {
             query,
             results,
@@ -821,6 +903,20 @@ impl App {
         mode: CodeSearchMode,
         results: Vec<CodeSearchResult>,
     ) {
+        match (mode, results.is_empty()) {
+            (CodeSearchMode::Definition, true) => self.set_status(format!(
+                "No definition found in the source files scanned for \"{query}\""
+            )),
+            (CodeSearchMode::Text, true) => self.set_status(format!(
+                "No match found in the source files scanned for \"{query}\""
+            )),
+            (CodeSearchMode::Definition, false) => {
+                self.set_status(format!("{} definition candidates", results.len()))
+            }
+            (CodeSearchMode::Text, false) => {
+                self.set_status(format!("{} code matches", results.len()))
+            }
+        }
         self.modal = Some(Modal::CodeSearch {
             mode,
             query,
@@ -829,8 +925,87 @@ impl App {
         });
     }
 
+    fn open_find_in_file(&mut self) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        let query = file.last_find.clone().unwrap_or_default();
+        let matches = find_lines(&file.content, &query);
+        let index = matches
+            .iter()
+            .position(|line| *line >= file.cursor_line)
+            .unwrap_or(0);
+        self.modal = Some(Modal::FindInFile {
+            query,
+            matches,
+            index,
+        });
+    }
+
+    fn apply_find_in_file(&mut self, query: String, matches: Vec<usize>, index: usize) {
+        let query = query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let status = {
+            let Some(file) = self.file.as_mut() else {
+                return;
+            };
+            file.last_find = Some(query.clone());
+            file.find_matches = matches;
+            file.find_index = index.min(file.find_matches.len().saturating_sub(1));
+            if let Some(line) = file.find_matches.get(file.find_index).copied() {
+                file.cursor_line = line;
+                file.viewport_top = line.saturating_sub(4);
+                file.tab = FileTab::Code;
+                format!(
+                    "Find: {} · match {}/{}",
+                    query,
+                    file.find_index + 1,
+                    file.find_matches.len()
+                )
+            } else {
+                format!("Find: no matches for {query}")
+            }
+        };
+        self.set_status(status);
+    }
+
+    fn repeat_find_in_file(&mut self, reverse: bool) {
+        if self
+            .file
+            .as_ref()
+            .is_none_or(|file| file.find_matches.is_empty())
+        {
+            self.open_find_in_file();
+            return;
+        }
+        let status = {
+            let file = self.file.as_mut().expect("file state checked above");
+            file.find_index = if reverse {
+                file.find_index
+                    .checked_sub(1)
+                    .unwrap_or(file.find_matches.len().saturating_sub(1))
+            } else {
+                (file.find_index + 1) % file.find_matches.len()
+            };
+            let line = file.find_matches[file.find_index];
+            file.cursor_line = line;
+            file.viewport_top = line.saturating_sub(4);
+            file.tab = FileTab::Code;
+            format!(
+                "Find: {} · match {}/{}",
+                file.last_find.as_deref().unwrap_or_default(),
+                file.find_index + 1,
+                file.find_matches.len()
+            )
+        };
+        self.set_status(status);
+    }
+
     pub fn handle_paste(&mut self, text: String) {
         let text = text.replace(['\r', '\n'], " ");
+        let file_content = self.file.as_ref().map(|file| file.content.clone());
         match self.modal.as_mut() {
             Some(Modal::TokenInput { input, .. }) => input.push_str(text.trim()),
             Some(Modal::RepositorySearch {
@@ -873,6 +1048,18 @@ impl App {
                 *results = filter_symbols(all_symbols, query);
                 *index = 0;
             }
+            Some(Modal::FindInFile {
+                query,
+                matches,
+                index,
+            }) => {
+                query.push_str(&text);
+                *matches = file_content
+                    .as_deref()
+                    .map(|content| find_lines(content, query))
+                    .unwrap_or_default();
+                *index = 0;
+            }
             None if self.screen == Screen::Home && self.home.focus == HomeFocus::Search => {
                 self.home.query.push_str(&text);
             }
@@ -887,12 +1074,24 @@ impl App {
         if self.loading.is_some() {
             return AppCommand::None;
         }
+        if key.code == KeyCode::F(1) {
+            self.modal = Some(Modal::Help);
+            return AppCommand::None;
+        }
         if key.code == KeyCode::F(2) {
             self.modal = Some(Modal::AuthMenu { index: 0 });
             return AppCommand::None;
         }
+        if key.code == KeyCode::F(10) {
+            self.toggle_footer_mode();
+            return AppCommand::PersistSettings;
+        }
         if self.modal.is_some() {
             return self.handle_modal_key(key);
+        }
+
+        if key.code == KeyCode::F(8) {
+            return AppCommand::ShowCacheManager;
         }
 
         if key.code == KeyCode::Char('?')
@@ -902,8 +1101,18 @@ impl App {
             return AppCommand::None;
         }
 
+        if key.code == KeyCode::Char('c')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+            && !(self.screen == Screen::Home && self.home.focus == HomeFocus::Search)
+        {
+            return AppCommand::ShowCacheManager;
+        }
+
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('A') | KeyCode::Char('a'))
+            && matches!(self.screen, Screen::File | Screen::Commit | Screen::Detail)
         {
             match self.screen {
                 Screen::File => {
@@ -939,6 +1148,7 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::Char('C') | KeyCode::Char('c'))
+            && matches!(self.screen, Screen::File | Screen::Commit | Screen::Detail)
         {
             return match self.screen {
                 Screen::File => self.file.as_ref().map_or(AppCommand::None, |file| {
@@ -959,6 +1169,9 @@ impl App {
         }
 
         if key.code == KeyCode::Char('a')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
             && !(self.screen == Screen::Home && self.home.focus == HomeFocus::Search)
         {
             self.modal = Some(Modal::AuthMenu { index: 0 });
@@ -973,6 +1186,9 @@ impl App {
             return AppCommand::PersistSettings;
         }
         if key.code == KeyCode::Char('w')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
             && matches!(self.screen, Screen::File | Screen::Commit | Screen::Detail)
         {
             self.toggle_context_wrap();
@@ -1064,15 +1280,38 @@ impl App {
                     AppCommand::None
                 }
             },
+            Modal::CacheManager { lines } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => AppCommand::None,
+                KeyCode::Char('d') | KeyCode::Delete => {
+                    self.modal = Some(Modal::ConfirmClearCache { lines });
+                    AppCommand::None
+                }
+                KeyCode::Char('r') | KeyCode::F(5) => AppCommand::ShowCacheManager,
+                _ => {
+                    self.modal = Some(Modal::CacheManager { lines });
+                    AppCommand::None
+                }
+            },
+            Modal::ConfirmClearCache { lines } => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => AppCommand::ClearCache,
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
+                    self.modal = Some(Modal::CacheManager { lines });
+                    AppCommand::None
+                }
+                _ => {
+                    self.modal = Some(Modal::ConfirmClearCache { lines });
+                    AppCommand::None
+                }
+            },
             Modal::Settings { mut index } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => AppCommand::None,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab => {
                     index = index.saturating_sub(1);
                     self.modal = Some(Modal::Settings { index });
                     AppCommand::None
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    index = (index + 1).min(2);
+                KeyCode::Down | KeyCode::Tab => {
+                    index = (index + 1).min(3);
                     self.modal = Some(Modal::Settings { index });
                     AppCommand::None
                 }
@@ -1080,7 +1319,8 @@ impl App {
                     match index {
                         0 => self.settings.theme = self.settings.theme.toggled(),
                         1 => self.settings.wrap_code = !self.settings.wrap_code,
-                        _ => self.settings.wrap_diff = !self.settings.wrap_diff,
+                        2 => self.settings.wrap_diff = !self.settings.wrap_diff,
+                        _ => self.settings.footer_mode = self.settings.footer_mode.toggled(),
                     }
                     self.modal = Some(Modal::Settings { index });
                     AppCommand::PersistSettings
@@ -1113,12 +1353,12 @@ impl App {
             },
             Modal::AuthMenu { mut index } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => AppCommand::None,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab => {
                     index = index.saturating_sub(1);
                     self.modal = Some(Modal::AuthMenu { index });
                     AppCommand::None
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Tab => {
                     index = (index + 1).min(2);
                     self.modal = Some(Modal::AuthMenu { index });
                     AppCommand::None
@@ -1202,7 +1442,7 @@ impl App {
                 let filtered = filter_branches(&branches, &query);
                 match key.code {
                     KeyCode::Esc => AppCommand::None,
-                    KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                    KeyCode::Up | KeyCode::BackTab => {
                         index = index.saturating_sub(1);
                         self.modal = Some(Modal::BranchPicker {
                             query,
@@ -1211,8 +1451,43 @@ impl App {
                         });
                         AppCommand::None
                     }
-                    KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                    KeyCode::Down | KeyCode::Tab => {
                         index = (index + 1).min(filtered.len().saturating_sub(1));
+                        self.modal = Some(Modal::BranchPicker {
+                            query,
+                            branches,
+                            index,
+                        });
+                        AppCommand::None
+                    }
+                    KeyCode::PageUp => {
+                        index = index.saturating_sub(15);
+                        self.modal = Some(Modal::BranchPicker {
+                            query,
+                            branches,
+                            index,
+                        });
+                        AppCommand::None
+                    }
+                    KeyCode::PageDown => {
+                        index = (index + 15).min(filtered.len().saturating_sub(1));
+                        self.modal = Some(Modal::BranchPicker {
+                            query,
+                            branches,
+                            index,
+                        });
+                        AppCommand::None
+                    }
+                    KeyCode::Home => {
+                        self.modal = Some(Modal::BranchPicker {
+                            query,
+                            branches,
+                            index: 0,
+                        });
+                        AppCommand::None
+                    }
+                    KeyCode::End => {
+                        index = filtered.len().saturating_sub(1);
                         self.modal = Some(Modal::BranchPicker {
                             query,
                             branches,
@@ -1261,7 +1536,7 @@ impl App {
                 mut index,
             } => match key.code {
                 KeyCode::Esc => AppCommand::None,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab => {
                     index = index.saturating_sub(1);
                     self.modal = Some(Modal::RepositorySearch {
                         query,
@@ -1270,8 +1545,43 @@ impl App {
                     });
                     AppCommand::None
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Tab => {
                     index = (index + 1).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::RepositorySearch {
+                        query,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageUp => {
+                    index = index.saturating_sub(15);
+                    self.modal = Some(Modal::RepositorySearch {
+                        query,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageDown => {
+                    index = (index + 15).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::RepositorySearch {
+                        query,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Home => {
+                    self.modal = Some(Modal::RepositorySearch {
+                        query,
+                        results,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::End => {
+                    index = results.len().saturating_sub(1);
                     self.modal = Some(Modal::RepositorySearch {
                         query,
                         results,
@@ -1340,7 +1650,7 @@ impl App {
                 mut index,
             } => match key.code {
                 KeyCode::Esc => AppCommand::None,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab => {
                     index = index.saturating_sub(1);
                     self.modal = Some(Modal::FileSearch {
                         query,
@@ -1350,8 +1660,47 @@ impl App {
                     });
                     AppCommand::None
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Tab => {
                     index = (index + 1).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::FileSearch {
+                        query,
+                        all_files,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageUp => {
+                    index = index.saturating_sub(15);
+                    self.modal = Some(Modal::FileSearch {
+                        query,
+                        all_files,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageDown => {
+                    index = (index + 15).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::FileSearch {
+                        query,
+                        all_files,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Home => {
+                    self.modal = Some(Modal::FileSearch {
+                        query,
+                        all_files,
+                        results,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::End => {
+                    index = results.len().saturating_sub(1);
                     self.modal = Some(Modal::FileSearch {
                         query,
                         all_files,
@@ -1377,6 +1726,8 @@ impl App {
                         .map_or(AppCommand::None, |path| AppCommand::OpenFile {
                             path: path.clone(),
                             find: None,
+                            line: None,
+                            definition: false,
                         })
                 }
                 KeyCode::Char(character)
@@ -1411,7 +1762,7 @@ impl App {
                 mut index,
             } => match key.code {
                 KeyCode::Esc => AppCommand::None,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab => {
                     index = index.saturating_sub(1);
                     self.modal = Some(Modal::CodeSearch {
                         mode,
@@ -1421,8 +1772,47 @@ impl App {
                     });
                     AppCommand::None
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Tab => {
                     index = (index + 1).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::CodeSearch {
+                        mode,
+                        query,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageUp => {
+                    index = index.saturating_sub(15);
+                    self.modal = Some(Modal::CodeSearch {
+                        mode,
+                        query,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageDown => {
+                    index = (index + 15).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::CodeSearch {
+                        mode,
+                        query,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Home => {
+                    self.modal = Some(Modal::CodeSearch {
+                        mode,
+                        query,
+                        results,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::End => {
+                    index = results.len().saturating_sub(1);
                     self.modal = Some(Modal::CodeSearch {
                         mode,
                         query,
@@ -1448,6 +1838,8 @@ impl App {
                         .map_or(AppCommand::None, |result| AppCommand::OpenFile {
                             path: result.path.clone(),
                             find: Some(query.clone()),
+                            line: result.line,
+                            definition: mode == CodeSearchMode::Definition,
                         })
                 }
                 KeyCode::Enter => {
@@ -1499,7 +1891,7 @@ impl App {
                 mut index,
             } => match key.code {
                 KeyCode::Esc => AppCommand::None,
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab => {
                     index = index.saturating_sub(1);
                     self.modal = Some(Modal::SymbolPicker {
                         query,
@@ -1509,8 +1901,47 @@ impl App {
                     });
                     AppCommand::None
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Tab => {
                     index = (index + 1).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::SymbolPicker {
+                        query,
+                        all_symbols,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageUp => {
+                    index = index.saturating_sub(15);
+                    self.modal = Some(Modal::SymbolPicker {
+                        query,
+                        all_symbols,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageDown => {
+                    index = (index + 15).min(results.len().saturating_sub(1));
+                    self.modal = Some(Modal::SymbolPicker {
+                        query,
+                        all_symbols,
+                        results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Home => {
+                    self.modal = Some(Modal::SymbolPicker {
+                        query,
+                        all_symbols,
+                        results,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::End => {
+                    index = results.len().saturating_sub(1);
                     self.modal = Some(Modal::SymbolPicker {
                         query,
                         all_symbols,
@@ -1560,6 +1991,118 @@ impl App {
                         query,
                         all_symbols,
                         results,
+                        index,
+                    });
+                    AppCommand::None
+                }
+            },
+            Modal::FindInFile {
+                mut query,
+                mut matches,
+                mut index,
+            } => match key.code {
+                KeyCode::Esc => AppCommand::None,
+                KeyCode::Up | KeyCode::BackTab => {
+                    index = index.saturating_sub(1);
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    index = (index + 1).min(matches.len().saturating_sub(1));
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageUp => {
+                    index = index.saturating_sub(15);
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::PageDown => {
+                    index = (index + 15).min(matches.len().saturating_sub(1));
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Home => {
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::End => {
+                    index = matches.len().saturating_sub(1);
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    matches = self
+                        .file
+                        .as_ref()
+                        .map(|file| find_lines(&file.content, &query))
+                        .unwrap_or_default();
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                KeyCode::Enter => {
+                    if query.trim().is_empty() {
+                        self.modal = Some(Modal::FindInFile {
+                            query,
+                            matches,
+                            index,
+                        });
+                    } else {
+                        self.apply_find_in_file(query, matches, index);
+                    }
+                    AppCommand::None
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(character);
+                    matches = self
+                        .file
+                        .as_ref()
+                        .map(|file| find_lines(&file.content, &query))
+                        .unwrap_or_default();
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
+                        index: 0,
+                    });
+                    AppCommand::None
+                }
+                _ => {
+                    self.modal = Some(Modal::FindInFile {
+                        query,
+                        matches,
                         index,
                     });
                     AppCommand::None
@@ -1622,8 +2165,26 @@ impl App {
                 }
                 AppCommand::None
             }
+            KeyCode::PageUp => {
+                self.move_home_selection(-10);
+                AppCommand::None
+            }
+            KeyCode::PageDown => {
+                self.move_home_selection(10);
+                AppCommand::None
+            }
+            KeyCode::Home => {
+                self.set_home_selection(false);
+                AppCommand::None
+            }
+            KeyCode::End => {
+                self.set_home_selection(true);
+                AppCommand::None
+            }
             KeyCode::Enter => self.open_selected_home_item(),
-            KeyCode::Char('r') | KeyCode::F(5) => AppCommand::RefreshHome,
+            KeyCode::Char('r') | KeyCode::F(5) => {
+                AppCommand::ForceRefresh(Box::new(AppCommand::RefreshHome))
+            }
             KeyCode::Esc => {
                 self.home.focus = HomeFocus::Search;
                 AppCommand::None
@@ -1637,7 +2198,7 @@ impl App {
             return AppCommand::PasteClipboard;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
-            return AppCommand::RefreshHome;
+            return AppCommand::ForceRefresh(Box::new(AppCommand::RefreshHome));
         }
         match key.code {
             KeyCode::Enter => {
@@ -1689,7 +2250,7 @@ impl App {
                 self.home.query.clear();
                 AppCommand::None
             }
-            KeyCode::F(5) => AppCommand::RefreshHome,
+            KeyCode::F(5) => AppCommand::ForceRefresh(Box::new(AppCommand::RefreshHome)),
             _ => AppCommand::None,
         }
     }
@@ -1702,6 +2263,12 @@ impl App {
             self.screen = Screen::Home;
             return AppCommand::None;
         };
+
+        if repository_tab_has_state_filter(repository.tab)
+            && let Some(filter) = direct_repository_state_filter(&key)
+        {
+            return set_repository_state_filter(repository, filter);
+        }
 
         match key.code {
             KeyCode::Esc => {
@@ -1757,6 +2324,12 @@ impl App {
                     AppCommand::OpenDirectory(repository.parent_path())
                 }
             }
+            KeyCode::Char('[') if repository_tab_has_state_filter(repository.tab) => {
+                cycle_repository_state_filter(repository, false)
+            }
+            KeyCode::Char(']') if repository_tab_has_state_filter(repository.tab) => {
+                cycle_repository_state_filter(repository, true)
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 move_repository_selection(repository, -1);
                 AppCommand::None
@@ -1775,20 +2348,38 @@ impl App {
                 AppCommand::None
             }
             KeyCode::Enter => enter_repository_selection(repository),
-            KeyCode::PageDown if repository.tab == RepositoryTab::Commits => {
-                AppCommand::LoadCommits {
-                    page: repository.commit_page.saturating_add(1),
+            KeyCode::PageDown => {
+                if repository.tab == RepositoryTab::Commits
+                    && repository.commit_index + 15 >= repository.commits.len()
+                    && !repository.commits.is_empty()
+                {
+                    AppCommand::LoadCommits {
+                        page: repository.commit_page.saturating_add(1),
+                    }
+                } else {
+                    move_repository_selection(repository, 15);
+                    AppCommand::None
                 }
             }
-            KeyCode::PageUp if repository.tab == RepositoryTab::Commits => {
-                AppCommand::LoadCommits {
-                    page: repository.commit_page.saturating_sub(1).max(1),
+            KeyCode::PageUp => {
+                if repository.tab == RepositoryTab::Commits
+                    && repository.commit_index < 15
+                    && repository.commit_page > 1
+                {
+                    AppCommand::LoadCommits {
+                        page: repository.commit_page.saturating_sub(1),
+                    }
+                } else {
+                    move_repository_selection(repository, -15);
+                    AppCommand::None
                 }
             }
             KeyCode::Char('o') => {
                 selected_external_url(repository).map_or(AppCommand::None, AppCommand::OpenExternal)
             }
-            KeyCode::Char('r') | KeyCode::F(5) => self.reload_repository_tab(),
+            KeyCode::Char('r') | KeyCode::F(5) => {
+                AppCommand::ForceRefresh(Box::new(self.reload_repository_tab()))
+            }
             _ => AppCommand::None,
         }
     }
@@ -1802,8 +2393,8 @@ impl App {
         let loaded = match tab {
             RepositoryTab::Code => true,
             RepositoryTab::Commits => !repository.commits.is_empty(),
-            RepositoryTab::PullRequests => !repository.pull_requests.is_empty(),
-            RepositoryTab::Issues => !repository.issues.is_empty(),
+            RepositoryTab::PullRequests => repository.pull_requests_loaded,
+            RepositoryTab::Issues => repository.issues_loaded,
             RepositoryTab::Actions => !repository.workflow_runs.is_empty(),
             RepositoryTab::Releases => !repository.releases.is_empty(),
         };
@@ -1826,9 +2417,97 @@ impl App {
             })
     }
 
+    fn go_to_definition(&mut self) -> AppCommand {
+        let Some(file) = self.file.as_ref() else {
+            return AppCommand::None;
+        };
+        let seed = symbols::identifier_near_cursor(file.cursor_line_text(), None);
+        if seed.is_empty() {
+            self.set_status("Definition: enter a symbol name");
+            self.modal = Some(Modal::CodeSearch {
+                mode: CodeSearchMode::Definition,
+                query: String::new(),
+                results: Vec::new(),
+                index: 0,
+            });
+            return AppCommand::None;
+        }
+        let local_definition = symbols::find_definition(&file.path, &file.content, &seed);
+        let path = file.path.clone();
+
+        if let Some(symbol) = local_definition {
+            if let Some(file) = self.file.as_mut() {
+                file.cursor_line = symbol.line.saturating_sub(1);
+                file.viewport_top = file.cursor_line.saturating_sub(4);
+                file.tab = FileTab::Code;
+            }
+            self.set_status(format!(
+                "Definition: {} · {path}:{}",
+                symbol.kind, symbol.line
+            ));
+            AppCommand::None
+        } else {
+            self.set_status(format!("Definition: searching the repository for {seed}"));
+            self.modal = Some(Modal::CodeSearch {
+                mode: CodeSearchMode::Definition,
+                query: seed.clone(),
+                results: Vec::new(),
+                index: 0,
+            });
+            AppCommand::SearchCode {
+                query: seed,
+                mode: CodeSearchMode::Definition,
+            }
+        }
+    }
+
     fn handle_file_key(&mut self, key: KeyEvent) -> AppCommand {
         if key.code == KeyCode::Char('q') {
             return AppCommand::Quit;
+        }
+        if key.code == KeyCode::Char('d')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return self.go_to_definition();
+        }
+        if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f'))
+            || (key.code == KeyCode::Char('/')
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+        {
+            self.open_find_in_file();
+            return AppCommand::None;
+        }
+        if key.code == KeyCode::Char('n')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+        {
+            self.repeat_find_in_file(false);
+            return AppCommand::None;
+        }
+        if key.code == KeyCode::Char('N')
+            || (key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            self.repeat_find_in_file(true);
+            return AppCommand::None;
+        }
+        if matches!(key.code, KeyCode::F(5) | KeyCode::Char('r'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT)
+        {
+            return self.file.as_ref().map_or(AppCommand::None, |file| {
+                AppCommand::ForceRefresh(Box::new(AppCommand::OpenFile {
+                    path: file.path.clone(),
+                    find: file.last_find.clone(),
+                    line: Some(file.cursor_line.saturating_add(1)),
+                    definition: false,
+                }))
+            });
         }
         let Some(file) = self.file.as_mut() else {
             self.screen = Screen::Repository;
@@ -1889,22 +2568,25 @@ impl App {
                 self.ensure_file_tab_loaded(FileTab::History)
             }
             KeyCode::Char('@') => {
+                let language = detect_language(&file.path, &file.content);
                 let all_symbols = symbols::extract_symbols(&file.path, &file.content);
                 let results = all_symbols.clone();
+                if all_symbols.is_empty() {
+                    self.set_status(format!(
+                        "Symbols: no outline items detected for {} in this file",
+                        language.label()
+                    ));
+                } else {
+                    self.set_status(format!(
+                        "Symbols: {} outline items detected for {}",
+                        all_symbols.len(),
+                        language.label()
+                    ));
+                }
                 self.modal = Some(Modal::SymbolPicker {
                     query: String::new(),
                     all_symbols,
                     results,
-                    index: 0,
-                });
-                AppCommand::None
-            }
-            KeyCode::Char('d') => {
-                let seed = identifier_from_line(file.cursor_line_text());
-                self.modal = Some(Modal::CodeSearch {
-                    mode: CodeSearchMode::Definition,
-                    query: seed,
-                    results: Vec::new(),
                     index: 0,
                 });
                 AppCommand::None
@@ -2253,6 +2935,19 @@ impl App {
         move_index(index, len, delta);
     }
 
+    fn set_home_selection(&mut self, end: bool) {
+        let (index, len) = match self.home.focus {
+            HomeFocus::Search => return,
+            HomeFocus::History => (&mut self.home.history_index, self.home.history.len()),
+            HomeFocus::Featured => (&mut self.home.featured_index, self.home.featured.len()),
+            HomeFocus::Recommended => (
+                &mut self.home.recommended_index,
+                self.home.recommended.len(),
+            ),
+        };
+        *index = if end { len.saturating_sub(1) } else { 0 };
+    }
+
     fn open_selected_home_item(&self) -> AppCommand {
         match self.home.focus {
             HomeFocus::Search => AppCommand::None,
@@ -2295,10 +2990,83 @@ fn selection_delta(key: KeyEvent) -> Option<isize> {
     }
 
     match key.code {
-        KeyCode::Char('K') => Some(-1),
-        KeyCode::Char('J') => Some(1),
+        KeyCode::Char('K') | KeyCode::Char('k') => Some(-1),
+        KeyCode::Char('J') | KeyCode::Char('j') => Some(1),
         _ => None,
     }
+}
+
+fn repository_tab_has_state_filter(tab: RepositoryTab) -> bool {
+    matches!(tab, RepositoryTab::PullRequests | RepositoryTab::Issues)
+}
+
+fn direct_repository_state_filter(key: &KeyEvent) -> Option<OpenClosedFilter> {
+    let KeyCode::Char(character) = key.code else {
+        return None;
+    };
+    match character {
+        'O' => Some(OpenClosedFilter::Open),
+        'C' => Some(OpenClosedFilter::Closed),
+        'A' => Some(OpenClosedFilter::All),
+        'o' if key.modifiers.contains(KeyModifiers::SHIFT) => Some(OpenClosedFilter::Open),
+        'c' if key.modifiers.contains(KeyModifiers::SHIFT) => Some(OpenClosedFilter::Closed),
+        'a' if key.modifiers.contains(KeyModifiers::SHIFT) => Some(OpenClosedFilter::All),
+        _ => None,
+    }
+}
+
+fn active_repository_state_filter(repository: &RepositoryState) -> Option<OpenClosedFilter> {
+    match repository.tab {
+        RepositoryTab::PullRequests => Some(repository.pull_request_filter),
+        RepositoryTab::Issues => Some(repository.issue_filter),
+        RepositoryTab::Code
+        | RepositoryTab::Commits
+        | RepositoryTab::Actions
+        | RepositoryTab::Releases => None,
+    }
+}
+
+fn cycle_repository_state_filter(repository: &mut RepositoryState, forward: bool) -> AppCommand {
+    let Some(current) = active_repository_state_filter(repository) else {
+        return AppCommand::None;
+    };
+    let next = if forward {
+        current.next()
+    } else {
+        current.previous()
+    };
+    set_repository_state_filter(repository, next)
+}
+
+fn set_repository_state_filter(
+    repository: &mut RepositoryState,
+    filter: OpenClosedFilter,
+) -> AppCommand {
+    let tab = repository.tab;
+    match tab {
+        RepositoryTab::PullRequests => {
+            if repository.pull_request_filter == filter && repository.pull_requests_loaded {
+                return AppCommand::None;
+            }
+            repository.pull_request_filter = filter;
+            repository.pull_requests.clear();
+            repository.pull_requests_loaded = false;
+        }
+        RepositoryTab::Issues => {
+            if repository.issue_filter == filter && repository.issues_loaded {
+                return AppCommand::None;
+            }
+            repository.issue_filter = filter;
+            repository.issues.clear();
+            repository.issues_loaded = false;
+        }
+        RepositoryTab::Code
+        | RepositoryTab::Commits
+        | RepositoryTab::Actions
+        | RepositoryTab::Releases => return AppCommand::None,
+    }
+    repository.list_index = 0;
+    AppCommand::LoadRepositoryTab(tab)
 }
 
 fn enter_repository_selection(repository: &RepositoryState) -> AppCommand {
@@ -2312,6 +3080,8 @@ fn enter_repository_selection(repository: &RepositoryState) -> AppCommand {
                     AppCommand::OpenFile {
                         path: entry.path.clone(),
                         find: None,
+                        line: None,
+                        definition: false,
                     }
                 } else {
                     AppCommand::None
@@ -2354,11 +3124,13 @@ fn selected_external_url(repository: &RepositoryState) -> Option<String> {
         RepositoryTab::PullRequests => repository
             .pull_requests
             .get(repository.list_index)
-            .map(|item| item.html_url.clone()),
+            .map(|item| item.html_url.clone())
+            .or_else(|| Some(format!("{}/pulls", repository.repository.html_url))),
         RepositoryTab::Issues => repository
             .issues
             .get(repository.list_index)
-            .map(|item| item.html_url.clone()),
+            .map(|item| item.html_url.clone())
+            .or_else(|| Some(format!("{}/issues", repository.repository.html_url))),
         RepositoryTab::Actions => repository
             .workflow_runs
             .get(repository.list_index)
@@ -2493,6 +3265,18 @@ fn filter_symbols(all: &[SymbolLocation], query: &str) -> Vec<SymbolLocation> {
         .collect()
 }
 
+fn find_lines(content: &str, query: &str) -> Vec<usize> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(line, value)| value.to_ascii_lowercase().contains(&query).then_some(line))
+        .collect()
+}
+
 fn fuzzy_score(value: &str, query: &str) -> Option<usize> {
     if query.is_empty() {
         return Some(value.len());
@@ -2509,32 +3293,6 @@ fn fuzzy_score(value: &str, query: &str) -> Option<usize> {
         score += relative;
     }
     Some(score)
-}
-
-fn identifier_from_line(line: &str) -> String {
-    line.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == ':'))
-        .filter(|token| token.len() >= 3)
-        .filter(|token| {
-            !matches!(
-                *token,
-                "pub"
-                    | "let"
-                    | "mut"
-                    | "self"
-                    | "return"
-                    | "const"
-                    | "static"
-                    | "impl"
-                    | "struct"
-                    | "class"
-                    | "function"
-                    | "async"
-                    | "await"
-            )
-        })
-        .max_by_key(|token| token.len())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn with_parent_entry(path: &str, mut entries: Vec<ContentEntry>) -> Vec<ContentEntry> {

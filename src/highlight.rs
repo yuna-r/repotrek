@@ -1,11 +1,12 @@
-use std::path::Path;
-
 use ratatui::{
     style::{Modifier, Style},
     text::Span,
 };
 
-use crate::theme::Theme;
+use crate::{
+    language::{DetectedLanguage, detect_language},
+    theme::Theme,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Language {
@@ -36,7 +37,16 @@ enum Language {
 
 #[must_use]
 pub fn source_spans(line: &str, path: &str, theme: Theme) -> Vec<Span<'static>> {
-    let language = language_for_path(path);
+    source_spans_with_language(line, detect_language(path, line), theme)
+}
+
+#[must_use]
+pub fn source_spans_with_language(
+    line: &str,
+    language: DetectedLanguage,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let language = Language::from(language);
     let expanded = line.replace('\t', "    ");
 
     if is_preprocessor(&expanded, language) {
@@ -76,8 +86,13 @@ pub fn source_spans(line: &str, path: &str, theme: Theme) -> Vec<Span<'static>> 
 
 #[must_use]
 pub fn source_html(line: &str, path: &str) -> String {
+    source_html_with_language(line, detect_language(path, line))
+}
+
+#[must_use]
+pub fn source_html_with_language(line: &str, language: DetectedLanguage) -> String {
     let theme = Theme::light();
-    source_spans(line, path, theme)
+    source_spans_with_language(line, language, theme)
         .into_iter()
         .map(|span| {
             let content = escape_html(span.content.as_ref());
@@ -190,7 +205,6 @@ fn tokenize_json(line: &str, theme: Theme) -> Vec<Span<'static>> {
 }
 
 fn tokenize_config(line: &str, language: Language, theme: Theme) -> Vec<Span<'static>> {
-    let _ = &language;
     let marker = "#";
     let comment_index = find_comment(line, marker);
     let (code, comment) =
@@ -934,42 +948,38 @@ fn is_keyword(token: &str, language: Language) -> bool {
     }
 }
 
-fn language_for_path(path: &str) -> Language {
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(path)
-        .to_ascii_lowercase();
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "rs" => Language::Rust,
-        "c" | "h" => Language::C,
-        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
-        "cs" => Language::CSharp,
-        "java" => Language::Java,
-        "kt" | "kts" => Language::Kotlin,
-        "swift" => Language::Swift,
-        "go" => Language::Go,
-        "py" | "pyi" => Language::Python,
-        "rb" => Language::Ruby,
-        "sh" | "bash" | "zsh" | "fish" => Language::Shell,
-        "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
-        "ts" | "tsx" | "mts" | "cts" => Language::TypeScript,
-        "json" | "jsonc" => Language::Json,
-        "yaml" | "yml" => Language::Yaml,
-        "toml" => Language::Toml,
-        "sql" => Language::Sql,
-        "html" | "htm" | "xml" | "svg" => Language::Html,
-        "css" | "scss" | "sass" | "less" => Language::Css,
-        "md" | "markdown" | "mdx" => Language::Markdown,
-        "lua" => Language::Lua,
-        "hs" | "lhs" => Language::Haskell,
-        _ if matches!(file_name.as_str(), "dockerfile" | "makefile") => Language::Shell,
-        _ => Language::Other,
+impl From<DetectedLanguage> for Language {
+    fn from(language: DetectedLanguage) -> Self {
+        match language {
+            DetectedLanguage::Rust => Self::Rust,
+            DetectedLanguage::C => Self::C,
+            DetectedLanguage::Cpp => Self::Cpp,
+            DetectedLanguage::CSharp => Self::CSharp,
+            DetectedLanguage::Java => Self::Java,
+            DetectedLanguage::Kotlin => Self::Kotlin,
+            DetectedLanguage::Swift => Self::Swift,
+            DetectedLanguage::Go => Self::Go,
+            DetectedLanguage::Python | DetectedLanguage::Starlark => Self::Python,
+            DetectedLanguage::Ruby | DetectedLanguage::Perl => Self::Ruby,
+            DetectedLanguage::Shell
+            | DetectedLanguage::Make
+            | DetectedLanguage::Dockerfile
+            | DetectedLanguage::CMake => Self::Shell,
+            DetectedLanguage::JavaScript => Self::JavaScript,
+            DetectedLanguage::TypeScript => Self::TypeScript,
+            DetectedLanguage::Json => Self::Json,
+            DetectedLanguage::Yaml => Self::Yaml,
+            DetectedLanguage::Toml => Self::Toml,
+            DetectedLanguage::Sql => Self::Sql,
+            DetectedLanguage::Html => Self::Html,
+            DetectedLanguage::Css => Self::Css,
+            DetectedLanguage::Markdown => Self::Markdown,
+            DetectedLanguage::Lua => Self::Lua,
+            DetectedLanguage::Haskell => Self::Haskell,
+            DetectedLanguage::Groovy => Self::Java,
+            DetectedLanguage::Php => Self::JavaScript,
+            DetectedLanguage::Other => Self::Other,
+        }
     }
 }
 
@@ -1062,16 +1072,23 @@ fn html_color(color: Option<ratatui::style::Color>, fallback: ratatui::style::Co
 
 #[cfg(test)]
 mod tests {
-    use super::{Language, language_for_path, source_spans};
-    use crate::theme::Theme;
+    use super::source_spans;
+    use crate::{
+        language::{DetectedLanguage, detect_language},
+        theme::Theme,
+    };
 
     #[test]
     fn detects_common_languages() {
-        assert_eq!(language_for_path("src/main.rs"), Language::Rust);
-        assert_eq!(language_for_path("app.py"), Language::Python);
-        assert_eq!(language_for_path("web.tsx"), Language::TypeScript);
-        assert_eq!(language_for_path("main.go"), Language::Go);
-        assert_eq!(language_for_path("config.yaml"), Language::Yaml);
+        assert_eq!(detect_language("src/main.rs", ""), DetectedLanguage::Rust);
+        assert_eq!(detect_language("app.py", ""), DetectedLanguage::Python);
+        assert_eq!(detect_language("web.tsx", ""), DetectedLanguage::TypeScript);
+        assert_eq!(detect_language("main.go", ""), DetectedLanguage::Go);
+        assert_eq!(detect_language("config.yaml", ""), DetectedLanguage::Yaml);
+        assert_eq!(
+            detect_language("Makefile", "all:\n\tcargo build\n"),
+            DetectedLanguage::Make
+        );
     }
 
     #[test]

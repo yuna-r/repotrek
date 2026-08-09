@@ -4,9 +4,9 @@ use thiserror::Error;
 
 use crate::model::{
     ApiResponse, BlameRange, BranchSummary, CodeSearchResult, CommitDetail, CommitSummary,
-    ContentEntry, IssueDetail, IssueSummary, PullRequestDetail, PullRequestSummary, RateLimit,
-    ReleaseDetail, ReleaseSummary, RepoCard, Repository, RepositoryId, TreeEntry,
-    WorkflowRunDetail, WorkflowRunSummary,
+    ContentEntry, IssueDetail, IssueSummary, OpenClosedFilter, PullRequestDetail,
+    PullRequestSummary, RateLimit, ReleaseDetail, ReleaseSummary, RepoCard, Repository,
+    RepositoryId, TreeEntry, WorkflowRunDetail, WorkflowRunSummary,
 };
 
 pub type ProviderResult<T> = Result<ApiResponse<T>, ProviderError>;
@@ -118,11 +118,19 @@ pub trait RepositoryProvider {
         per_page: u32,
     ) -> ProviderResult<Vec<CodeSearchResult>>;
 
-    fn pull_requests(&self, id: &RepositoryId) -> ProviderResult<Vec<PullRequestSummary>>;
+    fn pull_requests(
+        &self,
+        id: &RepositoryId,
+        state: OpenClosedFilter,
+    ) -> ProviderResult<Vec<PullRequestSummary>>;
 
     fn pull_request(&self, id: &RepositoryId, number: u64) -> ProviderResult<PullRequestDetail>;
 
-    fn issues(&self, id: &RepositoryId) -> ProviderResult<Vec<IssueSummary>>;
+    fn issues(
+        &self,
+        id: &RepositoryId,
+        state: OpenClosedFilter,
+    ) -> ProviderResult<Vec<IssueSummary>>;
 
     fn issue(&self, id: &RepositoryId, number: u64) -> ProviderResult<IssueDetail>;
 

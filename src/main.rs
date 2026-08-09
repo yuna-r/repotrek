@@ -1,11 +1,13 @@
 mod app;
 mod auth;
+mod cache;
 mod cli;
 mod clipboard;
 mod diff;
 mod export;
 mod highlight;
 mod icons;
+mod language;
 mod model;
 mod provider;
 mod settings;
@@ -14,14 +16,27 @@ mod symbols;
 mod theme;
 mod ui;
 
-use std::{io::stdout, process::Command, str::FromStr, time::Duration};
+use std::{
+    collections::HashSet,
+    io::stdout,
+    process::Command,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, TryRecvError},
+    },
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::Parser;
 use crossterm::{
     event::{
-        self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
@@ -30,14 +45,27 @@ use crossterm::{
 use ratatui::DefaultTerminal;
 
 use crate::{
-    app::{App, AppCommand, DetailDocument, RepositoryTab},
+    app::{App, AppCommand, CodeSearchMode, DetailDocument, RepositoryTab},
     cli::Cli,
     icons::Icons,
-    model::{ApiResponse, HistoryScreen, RepositoryId},
+    model::{ApiResponse, CodeSearchResult, HistoryScreen, RateLimit, RepositoryId, TreeEntry},
     provider::{ProviderError, ProviderResult, RepositoryProvider, github::GitHubProvider},
     settings::{SettingsStore, save_settings},
     storage::HistoryStore,
 };
+
+enum CodeSearchWorkerMessage {
+    Progress(String),
+    Finished(ProviderResult<Vec<CodeSearchResult>>),
+}
+
+struct CancelSearchOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelSearchOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 fn main() -> Result<()> {
     install_panic_hook();
@@ -63,6 +91,7 @@ fn main() -> Result<()> {
     );
 
     let mut terminal = ratatui::try_init().context("Could not initialize terminal")?;
+    let _ = enable_mouse_capture();
     let keyboard_enhancement = enable_keyboard_enhancement();
     let result = run(
         &mut terminal,
@@ -72,6 +101,7 @@ fn main() -> Result<()> {
         cli.repository,
         cli.no_home_refresh,
     );
+    disable_mouse_capture();
     if keyboard_enhancement {
         disable_keyboard_enhancement();
     }
@@ -100,6 +130,16 @@ fn enable_keyboard_enhancement() -> bool {
 fn disable_keyboard_enhancement() {
     let mut output = stdout();
     let _ = execute!(output, PopKeyboardEnhancementFlags);
+}
+
+fn enable_mouse_capture() -> bool {
+    let mut output = stdout();
+    execute!(output, EnableMouseCapture).is_ok()
+}
+
+fn disable_mouse_capture() {
+    let mut output = stdout();
+    let _ = execute!(output, DisableMouseCapture);
 }
 
 fn run(
@@ -146,6 +186,14 @@ fn run(
                 }
                 execute_command(command, app, provider, history, terminal)?;
             }
+            Event::Mouse(mouse) => {
+                let (width, height) = crossterm::terminal::size()?;
+                let command = ui::handle_mouse(app, mouse, width, height);
+                if matches!(command, AppCommand::Quit) {
+                    break;
+                }
+                execute_command(command, app, provider, history, terminal)?;
+            }
             Event::Paste(text) => app.handle_paste(text),
             Event::Resize(_, _) => {}
             _ => {}
@@ -163,6 +211,26 @@ fn execute_command(
 ) -> Result<()> {
     match command.clone() {
         AppCommand::None | AppCommand::Quit => {}
+        AppCommand::ForceRefresh(inner) => {
+            provider.set_force_refresh(true);
+            let result = execute_command(*inner, app, provider, history, terminal);
+            provider.set_force_refresh(false);
+            result?;
+        }
+        AppCommand::ShowCacheManager => {
+            app.show_cache_manager(provider.cache_summary().lines());
+        }
+        AppCommand::ClearCache => match provider.clear_cache() {
+            Ok(cleared) => {
+                app.modal = None;
+                app.set_cache_status(None);
+                app.set_status(format!(
+                    "Cleared {} cached responses ({} bytes)",
+                    cleared.entries, cleared.bytes
+                ));
+            }
+            Err(error) => app.show_error("Cache", error.to_string()),
+        },
         AppCommand::OpenRepository {
             id,
             resume_path,
@@ -207,11 +275,12 @@ fn execute_command(
             };
             let id = repository.repository.id.clone();
             let git_ref = repository.selected_ref.clone();
-            let entries = request(
+            let entries = request_with_context(
                 app,
                 terminal,
                 format!("Loading {}/{}", id, display_path(&path)),
                 command,
+                RequestContext::Directory(path.clone()),
                 || provider.contents(&id, &path, &git_ref),
             )?;
             if let Some(entries) = entries {
@@ -219,17 +288,40 @@ fn execute_command(
                 update_history_location(app, history, &id, Some(path), HistoryScreen::Code);
             }
         }
-        AppCommand::OpenFile { path, find } => {
+        AppCommand::OpenFile {
+            path,
+            find,
+            line,
+            definition,
+        } => {
             let Some(repository) = app.repository.as_ref() else {
                 return Ok(());
             };
             let id = repository.repository.id.clone();
             let git_ref = repository.selected_ref.clone();
-            let content = request(app, terminal, format!("Loading {path}"), command, || {
-                provider.file_content(&id, &path, &git_ref)
-            })?;
+            let content = request_with_context(
+                app,
+                terminal,
+                format!("Loading {path}"),
+                command,
+                RequestContext::File(path.clone()),
+                || provider.file_content(&id, &path, &git_ref),
+            )?;
             if let Some(content) = content {
-                app.open_file(path.clone(), content, find.as_deref());
+                let definition_line = if definition {
+                    find.as_deref().and_then(|query| {
+                        symbols::find_definition(&path, &content, query).map(|symbol| symbol.line)
+                    })
+                } else {
+                    None
+                };
+                let target_line = definition_line.or(line);
+                app.open_file(path.clone(), content, find.as_deref(), target_line);
+                if definition && definition_line.is_none() {
+                    app.set_status(format!(
+                        "No declaration pattern found in {path}; jumped to the first text match"
+                    ));
+                }
                 update_history_location(app, history, &id, Some(path), HistoryScreen::File);
             }
         }
@@ -361,11 +453,12 @@ fn execute_command(
             };
             let id = repository.repository.id.clone();
             let root = String::new();
-            let entries = request(
+            let entries = request_with_context(
                 app,
                 terminal,
                 format!("Switching to {branch}"),
                 command,
+                RequestContext::Branch(branch.clone()),
                 || provider.contents(&id, &root, &branch),
             )?;
             if let Some(entries) = entries {
@@ -395,12 +488,16 @@ fn execute_command(
                 return Ok(());
             };
             let id = repository.repository.id.clone();
-            let results = request(
+            let git_ref = repository.selected_ref.clone();
+            let results = cancellable_code_search(
                 app,
                 terminal,
-                format!("Searching code: {query}"),
+                provider.clone(),
+                id,
+                git_ref,
+                query.clone(),
+                mode,
                 command,
-                || provider.search_code(&id, &query, 100),
             )?;
             if let Some(results) = results {
                 app.set_code_search_results(query, mode, results);
@@ -504,6 +601,7 @@ fn execute_command(
             Err(error) => app.show_error("Open browser", error.to_string()),
         },
     }
+    app.set_cache_status(provider.cache_status_line());
     Ok(())
 }
 
@@ -519,6 +617,8 @@ fn load_repository_tab(
     };
     let id = repository.repository.id.clone();
     let git_ref = repository.selected_ref.clone();
+    let pull_request_filter = repository.pull_request_filter;
+    let issue_filter = repository.issue_filter;
     match tab {
         RepositoryTab::Code => {}
         RepositoryTab::Commits => {
@@ -533,20 +633,24 @@ fn load_repository_tab(
             let values = request(
                 app,
                 terminal,
-                "Loading pull requests".to_owned(),
+                format!("Loading {} pull requests", pull_request_filter.label()),
                 retry,
-                || provider.pull_requests(&id),
+                || provider.pull_requests(&id, pull_request_filter),
             )?;
             if let Some(values) = values {
-                app.set_pull_requests(values);
+                app.set_pull_requests(pull_request_filter, values);
             }
         }
         RepositoryTab::Issues => {
-            let values = request(app, terminal, "Loading issues".to_owned(), retry, || {
-                provider.issues(&id)
-            })?;
+            let values = request(
+                app,
+                terminal,
+                format!("Loading {} issues", issue_filter.label()),
+                retry,
+                || provider.issues(&id, issue_filter),
+            )?;
             if let Some(values) = values {
-                app.set_issues(values);
+                app.set_issues(issue_filter, values);
             }
         }
         RepositoryTab::Actions => {
@@ -584,11 +688,12 @@ fn open_repository(
     history: &mut HistoryStore,
     terminal: &mut DefaultTerminal,
 ) -> Result<()> {
-    let Some(repository) = request(
+    let Some(repository) = request_with_context(
         app,
         terminal,
         format!("Opening {id}"),
         retry.clone(),
+        RequestContext::Repository(id.clone()),
         || provider.repository(&id),
     )?
     else {
@@ -601,11 +706,12 @@ fn open_repository(
         HistoryScreen::Commits | HistoryScreen::Commit => String::new(),
     };
 
-    let Some(entries) = request(
+    let Some(entries) = request_with_context(
         app,
         terminal,
         format!("Loading {}/{}", id, display_path(&directory_path)),
         retry.clone(),
+        RequestContext::Directory(directory_path.clone()),
         || provider.contents(&id, &directory_path, &repository.default_branch),
     )?
     else {
@@ -620,11 +726,16 @@ fn open_repository(
 
     match (resume_screen, resume_path) {
         (HistoryScreen::File, Some(path)) => {
-            let content = request(app, terminal, format!("Restoring {path}"), retry, || {
-                provider.file_content(&id, &path, &repository.default_branch)
-            })?;
+            let content = request_with_context(
+                app,
+                terminal,
+                format!("Restoring {path}"),
+                retry,
+                RequestContext::File(path.clone()),
+                || provider.file_content(&id, &path, &repository.default_branch),
+            )?;
             if let Some(content) = content {
-                app.open_file(path, content, None);
+                app.open_file(path, content, None, None);
             }
         }
         (HistoryScreen::Commits, _) => {
@@ -700,18 +811,431 @@ fn refresh_home(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cancellable_code_search(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    provider: GitHubProvider,
+    id: RepositoryId,
+    git_ref: String,
+    query: String,
+    mode: CodeSearchMode,
+    retry: AppCommand,
+) -> Result<Option<Vec<CodeSearchResult>>> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelSearchOnDrop(Arc::clone(&cancelled));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let (sender, receiver) = mpsc::channel();
+    let initial_message = format!(
+        "{} search: querying GitHub for {query} · Esc/Ctrl+C cancels",
+        code_search_mode_label(mode)
+    );
+    app.loading = Some(initial_message);
+    terminal.draw(|frame| ui::draw(frame, app))?;
+
+    let _search_worker = thread::spawn(move || {
+        let result = enriched_code_search(
+            &provider,
+            &id,
+            &git_ref,
+            &query,
+            mode,
+            worker_cancelled.as_ref(),
+            |message| {
+                let _ = sender.send(CodeSearchWorkerMessage::Progress(message));
+            },
+        );
+        let _ = sender.send(CodeSearchWorkerMessage::Finished(result));
+    });
+
+    loop {
+        let mut redraw = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(CodeSearchWorkerMessage::Progress(message)) => {
+                    app.loading = Some(format!("{message} · Esc/Ctrl+C cancels"));
+                    redraw = true;
+                }
+                Ok(CodeSearchWorkerMessage::Finished(result)) => {
+                    app.loading = None;
+                    return match result {
+                        Ok(ApiResponse { value, rate_limit }) => {
+                            app.update_rate_limit(rate_limit);
+                            Ok(Some(value))
+                        }
+                        Err(error) => {
+                            if let Some(rate_limit) = error.rate_limit() {
+                                app.update_rate_limit(rate_limit.clone());
+                            }
+                            handle_provider_error(app, error, retry, RequestContext::Auto);
+                            Ok(None)
+                        }
+                    };
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    app.loading = None;
+                    app.show_error(
+                        "Code search",
+                        "The background search stopped unexpectedly before returning a result",
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        if redraw {
+            terminal.draw(|frame| ui::draw(frame, app))?;
+        }
+
+        if !event::poll(Duration::from_millis(60))? {
+            continue;
+        }
+
+        match event::read()? {
+            Event::Key(key)
+                if !key.is_release()
+                    && (key.code == KeyCode::Esc
+                        || (key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c'))) =>
+            {
+                mark_code_search_cancelled(app, cancelled.as_ref(), mode);
+                return Ok(None);
+            }
+            Event::Mouse(mouse)
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) =>
+            {
+                mark_code_search_cancelled(app, cancelled.as_ref(), mode);
+                return Ok(None);
+            }
+            Event::Resize(_, _) => {
+                terminal.draw(|frame| ui::draw(frame, app))?;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn enriched_code_search(
+    provider: &GitHubProvider,
+    id: &RepositoryId,
+    git_ref: &str,
+    query: &str,
+    mode: CodeSearchMode,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(String),
+) -> ProviderResult<Vec<CodeSearchResult>> {
+    let mut rate_limit = RateLimit::default();
+    let mut deferred_error = None;
+    progress(format!(
+        "{} search: querying GitHub code index",
+        code_search_mode_label(mode)
+    ));
+    let api_candidates = match provider.search_code(id, query, 50) {
+        Ok(ApiResponse {
+            value,
+            rate_limit: search_rate_limit,
+        }) => {
+            update_rate_limit(&mut rate_limit, search_rate_limit);
+            value
+        }
+        Err(ProviderError::AuthenticationRequired {
+            rate_limit: limited,
+        }) => {
+            update_rate_limit(&mut rate_limit, limited);
+            Vec::new()
+        }
+        Err(ProviderError::Api {
+            status: 401 | 403,
+            rate_limit: limited,
+            ..
+        }) => {
+            update_rate_limit(&mut rate_limit, limited);
+            Vec::new()
+        }
+        Err(error) => {
+            deferred_error = Some(error);
+            Vec::new()
+        }
+    };
+
+    let mut results = Vec::new();
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(ApiResponse {
+            value: results,
+            rate_limit,
+        });
+    }
+
+    let indexed_limit = match mode {
+        CodeSearchMode::Definition => 24,
+        CodeSearchMode::Text => 50,
+    };
+    let indexed_total = api_candidates.len().min(indexed_limit);
+    let mut scanned = HashSet::new();
+    for (index, candidate) in api_candidates.iter().take(indexed_limit).enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(ApiResponse {
+                value: results,
+                rate_limit,
+            });
+        }
+        progress(format!(
+            "{} search: indexed file {}/{} · {}",
+            code_search_mode_label(mode),
+            index + 1,
+            indexed_total,
+            candidate.path
+        ));
+        scanned.insert(candidate.path.clone());
+        if let Ok(ApiResponse {
+            value: content,
+            rate_limit: file_rate_limit,
+        }) = provider.file_content(id, &candidate.path, git_ref)
+        {
+            update_rate_limit(&mut rate_limit, file_rate_limit);
+            append_code_search_matches(&mut results, mode, query, candidate, &content);
+        }
+        if code_search_limit_reached(mode, results.len()) {
+            break;
+        }
+    }
+
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(ApiResponse {
+            value: results,
+            rate_limit,
+        });
+    }
+
+    let needs_local_fallback = results.is_empty()
+        || (mode == CodeSearchMode::Definition && results.len() < 8)
+        || (mode == CodeSearchMode::Text && results.len() < 20);
+    if needs_local_fallback {
+        progress(format!(
+            "{} search: loading repository file index",
+            code_search_mode_label(mode)
+        ));
+        match provider.tree(id, git_ref) {
+            Ok(ApiResponse {
+                value: tree,
+                rate_limit: tree_rate_limit,
+            }) => {
+                update_rate_limit(&mut rate_limit, tree_rate_limit);
+                let candidates = local_search_candidates(
+                    tree,
+                    query,
+                    &scanned,
+                    provider.is_authenticated(),
+                    mode,
+                );
+                let candidate_count = candidates.len();
+                for (index, entry) in candidates.into_iter().enumerate() {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return Ok(ApiResponse {
+                            value: results,
+                            rate_limit,
+                        });
+                    }
+                    progress(format!(
+                        "{} search: repository file {}/{} · {}",
+                        code_search_mode_label(mode),
+                        index + 1,
+                        candidate_count,
+                        entry.path
+                    ));
+                    let candidate = tree_entry_as_search_result(entry);
+                    if let Ok(ApiResponse {
+                        value: content,
+                        rate_limit: file_rate_limit,
+                    }) = provider.file_content(id, &candidate.path, git_ref)
+                    {
+                        update_rate_limit(&mut rate_limit, file_rate_limit);
+                        append_code_search_matches(&mut results, mode, query, &candidate, &content);
+                    }
+                    if code_search_limit_reached(mode, results.len()) {
+                        break;
+                    }
+                }
+            }
+            Err(tree_error) if api_candidates.is_empty() && results.is_empty() => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(ApiResponse {
+                        value: results,
+                        rate_limit,
+                    });
+                }
+                return Err(deferred_error.unwrap_or(tree_error));
+            }
+            Err(_) => {}
+        }
+    }
+
+    let mut seen = HashSet::new();
+    results.retain(|result| seen.insert((result.path.clone(), result.line)));
+    results.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+    });
+
+    Ok(ApiResponse {
+        value: results,
+        rate_limit,
+    })
+}
+
+fn code_search_mode_label(mode: CodeSearchMode) -> &'static str {
+    match mode {
+        CodeSearchMode::Definition => "Definition",
+        CodeSearchMode::Text => "Code",
+    }
+}
+
+fn mark_code_search_cancelled(app: &mut App, cancelled: &AtomicBool, mode: CodeSearchMode) {
+    cancelled.store(true, Ordering::Relaxed);
+    app.loading = None;
+    app.modal = None;
+    app.set_status(format!(
+        "{} search cancelled; an in-flight request may finish in the background, but its result will be ignored",
+        code_search_mode_label(mode)
+    ));
+}
+
+fn append_code_search_matches(
+    results: &mut Vec<CodeSearchResult>,
+    mode: CodeSearchMode,
+    query: &str,
+    candidate: &CodeSearchResult,
+    content: &str,
+) {
+    match mode {
+        CodeSearchMode::Definition => {
+            if let Some(symbol) = symbols::find_definition(&candidate.path, content, query) {
+                results.push(CodeSearchResult {
+                    name: symbol.name,
+                    path: candidate.path.clone(),
+                    sha: candidate.sha.clone(),
+                    html_url: candidate.html_url.clone(),
+                    line: Some(symbol.line),
+                    preview: content
+                        .lines()
+                        .nth(symbol.line.saturating_sub(1))
+                        .map(code_preview),
+                    kind: Some(symbol.kind),
+                });
+            }
+        }
+        CodeSearchMode::Text => {
+            for (line, preview) in symbols::text_matches(content, query, 4) {
+                results.push(CodeSearchResult {
+                    name: candidate.name.clone(),
+                    path: candidate.path.clone(),
+                    sha: candidate.sha.clone(),
+                    html_url: candidate.html_url.clone(),
+                    line: Some(line),
+                    preview: Some(code_preview(&preview)),
+                    kind: Some("match".to_owned()),
+                });
+            }
+        }
+    }
+}
+
+fn local_search_candidates(
+    tree: Vec<TreeEntry>,
+    query: &str,
+    excluded: &HashSet<String>,
+    authenticated: bool,
+    mode: CodeSearchMode,
+) -> Vec<TreeEntry> {
+    let query = query.to_ascii_lowercase();
+    let mut candidates = tree
+        .into_iter()
+        .filter(TreeEntry::is_file)
+        .filter(|entry| entry.size.unwrap_or(0) <= 1_500_000)
+        .filter(|entry| symbols::is_searchable_path(&entry.path))
+        .filter(|entry| !excluded.contains(&entry.path))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|entry| {
+        let path = entry.path.to_ascii_lowercase();
+        (
+            !path.contains(&query),
+            path.matches('/').count(),
+            entry.size.unwrap_or(u64::MAX),
+            path,
+        )
+    });
+    candidates.truncate(match (mode, authenticated) {
+        (CodeSearchMode::Definition, true) => 60,
+        (CodeSearchMode::Definition, false) => 24,
+        (CodeSearchMode::Text, true) => 120,
+        (CodeSearchMode::Text, false) => 28,
+    });
+    candidates
+}
+
+fn tree_entry_as_search_result(entry: TreeEntry) -> CodeSearchResult {
+    let name = entry
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&entry.path)
+        .to_owned();
+    CodeSearchResult {
+        name,
+        path: entry.path,
+        sha: entry.sha,
+        html_url: String::new(),
+        line: None,
+        preview: None,
+        kind: None,
+    }
+}
+
+fn code_search_limit_reached(mode: CodeSearchMode, len: usize) -> bool {
+    match mode {
+        CodeSearchMode::Definition => len >= 16,
+        CodeSearchMode::Text => len >= 120,
+    }
+}
+
+fn update_rate_limit(current: &mut RateLimit, newer: RateLimit) {
+    if rate_limit_has_values(&newer) {
+        *current = newer;
+    }
+}
+
+fn code_preview(line: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let line = line.trim();
+    let mut preview = line.chars().take(MAX_CHARS).collect::<String>();
+    if line.chars().count() > MAX_CHARS {
+        preview.push_str(" [truncated]");
+    }
+    preview
+}
+
+fn rate_limit_has_values(rate_limit: &RateLimit) -> bool {
+    rate_limit.limit.is_some()
+        || rate_limit.remaining.is_some()
+        || rate_limit.reset_epoch.is_some()
+        || rate_limit.resource.is_some()
+}
+
 fn authenticate_cli(
     app: &mut App,
     provider: &mut GitHubProvider,
     history: &mut HistoryStore,
     terminal: &mut DefaultTerminal,
 ) -> Result<()> {
+    disable_mouse_capture();
     ratatui::try_restore().context("Could not restore terminal before authentication")?;
     println!("RepoTrek GitHub authentication");
     println!("Authorize RepoTrek through GitHub CLI in the browser.\n");
     let authentication = auth::authenticate_with_github_cli();
     *terminal =
         ratatui::try_init().context("Could not reinitialize terminal after authentication")?;
+    let _ = enable_mouse_capture();
 
     match authentication {
         Ok(token) => finish_token_auth(token, false, app, provider, history, terminal)?,
@@ -780,11 +1304,38 @@ fn finish_token_auth(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+enum RequestContext {
+    Auto,
+    Repository(RepositoryId),
+    Directory(String),
+    File(String),
+    Branch(String),
+}
+
 fn request<T>(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     message: String,
     retry: AppCommand,
+    operation: impl FnOnce() -> ProviderResult<T>,
+) -> Result<Option<T>> {
+    request_with_context(
+        app,
+        terminal,
+        message,
+        retry,
+        RequestContext::Auto,
+        operation,
+    )
+}
+
+fn request_with_context<T>(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    message: String,
+    retry: AppCommand,
+    context: RequestContext,
     operation: impl FnOnce() -> ProviderResult<T>,
 ) -> Result<Option<T>> {
     app.loading = Some(message);
@@ -801,13 +1352,23 @@ fn request<T>(
             if let Some(rate_limit) = error.rate_limit() {
                 app.update_rate_limit(rate_limit.clone());
             }
-            handle_provider_error(app, error, retry);
+            handle_provider_error(app, error, retry, context);
             Ok(None)
         }
     }
 }
 
-fn handle_provider_error(app: &mut App, error: ProviderError, retry: AppCommand) {
+fn handle_provider_error(
+    app: &mut App,
+    error: ProviderError,
+    retry: AppCommand,
+    context: RequestContext,
+) {
+    if matches!(&error, ProviderError::Api { status: 404, .. }) {
+        show_not_found(app, &retry, context);
+        return;
+    }
+
     match error {
         ProviderError::AuthenticationRequired { .. } if !app.authenticated => {
             app.show_auth_required(retry);
@@ -845,6 +1406,73 @@ fn handle_provider_error(app: &mut App, error: ProviderError, retry: AppCommand)
             );
         }
         other => app.show_error("GitHub", other.to_string()),
+    }
+}
+
+fn show_not_found(app: &mut App, retry: &AppCommand, context: RequestContext) {
+    let private_hint = if app.authenticated {
+        "GitHub also returns 404 when the current token cannot access a private repository. Check the token's repository permissions."
+    } else {
+        "GitHub also returns 404 for private repositories. Press F2 to authenticate if the repository is not public."
+    };
+
+    match context {
+        RequestContext::Repository(id) => app.show_error(
+            "Repository not found",
+            format!(
+                "Could not find `{}`. Check the owner/repository spelling.\n\n{private_hint}",
+                id.full_name()
+            ),
+        ),
+        RequestContext::Directory(path) => app.show_error(
+            "Directory not found",
+            format!(
+                "`{}` does not exist at the selected branch or commit. Refresh the repository if it changed recently.",
+                if path.is_empty() { "/" } else { path.as_str() }
+            ),
+        ),
+        RequestContext::File(path) => app.show_error(
+            "File not found",
+            format!(
+                "`{path}` does not exist at the selected branch or commit. It may have been renamed or removed."
+            ),
+        ),
+        RequestContext::Branch(branch) => app.show_error(
+            "Branch not found",
+            format!("The branch or tag `{branch}` no longer exists."),
+        ),
+        RequestContext::Auto => match retry {
+            AppCommand::OpenRepository { id, .. } => app.show_error(
+                "Repository not found",
+                format!(
+                    "Could not find `{}`. Check the owner/repository spelling.\n\n{private_hint}",
+                    id.full_name()
+                ),
+            ),
+            AppCommand::OpenFile { path, .. } => app.show_error(
+                "File not found",
+                format!(
+                    "`{path}` does not exist at the selected branch or commit. It may have been renamed or removed."
+                ),
+            ),
+            AppCommand::OpenDirectory(path) => app.show_error(
+                "Directory not found",
+                format!(
+                    "`{}` does not exist at the selected branch or commit. Refresh the repository if it changed recently.",
+                    if path.is_empty() { "/" } else { path.as_str() }
+                ),
+            ),
+            AppCommand::SwitchBranch(branch) => app.show_error(
+                "Branch not found",
+                format!("The branch or tag `{branch}` no longer exists."),
+            ),
+            _ => app.show_error(
+                "GitHub item not found",
+                format!(
+                    "The requested repository item does not exist at the selected revision.\n\n{private_hint}"
+                ),
+            ),
+        },
     }
 }
 
@@ -905,6 +1533,7 @@ fn short_sha(sha: &str) -> &str {
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        disable_mouse_capture();
         let _ = ratatui::try_restore();
         original(panic_info);
     }));

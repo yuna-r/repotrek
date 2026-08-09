@@ -244,6 +244,58 @@ impl From<&Repository> for RepoCard {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenClosedFilter {
+    #[default]
+    Open,
+    Closed,
+    All,
+}
+
+impl OpenClosedFilter {
+    pub const ALL: [Self; 3] = [Self::Open, Self::Closed, Self::All];
+
+    #[must_use]
+    pub const fn api_value(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::All => "all",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Closed => "Closed",
+            Self::All => "All",
+        }
+    }
+
+    #[must_use]
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    #[must_use]
+    pub fn previous(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Open => 0,
+            Self::Closed => 1,
+            Self::All => 2,
+        }
+    }
+}
+
+fn default_open_state() -> String {
+    "open".to_owned()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestSummary {
     pub number: u64,
@@ -255,6 +307,10 @@ pub struct PullRequestSummary {
     pub comments: u64,
     pub updated_at: DateTime<Utc>,
     pub html_url: String,
+    #[serde(default = "default_open_state")]
+    pub state: String,
+    #[serde(default)]
+    pub merged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +322,8 @@ pub struct IssueSummary {
     pub labels: Vec<String>,
     pub updated_at: DateTime<Utc>,
     pub html_url: String,
+    #[serde(default = "default_open_state")]
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +427,12 @@ pub struct CodeSearchResult {
     pub path: String,
     pub sha: String,
     pub html_url: String,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,7 +500,7 @@ pub struct ApiResponse<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::RepositoryId;
+    use super::{OpenClosedFilter, RepositoryId};
 
     #[test]
     fn parses_short_form() {
@@ -469,5 +533,15 @@ mod tests {
             .parse::<RepositoryId>()
             .expect_err("unsupported host");
         assert_eq!(error, super::RepositoryIdParseError::UnsupportedHost);
+    }
+
+    #[test]
+    fn open_closed_filter_cycles_in_both_directions() {
+        assert_eq!(OpenClosedFilter::Open.next(), OpenClosedFilter::Closed);
+        assert_eq!(OpenClosedFilter::Closed.next(), OpenClosedFilter::All);
+        assert_eq!(OpenClosedFilter::All.next(), OpenClosedFilter::Open);
+        assert_eq!(OpenClosedFilter::Open.previous(), OpenClosedFilter::All);
+        assert_eq!(OpenClosedFilter::All.api_value(), "all");
+        assert_eq!(OpenClosedFilter::Closed.label(), "Closed");
     }
 }
